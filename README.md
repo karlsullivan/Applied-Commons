@@ -31,9 +31,9 @@ OpenCarbon explores practical approaches to greenhouse-gas removal, durable carb
 
 The objective is to combine existing research, open technologies, and practical engineering into systems that can be independently built, tested, and evaluated.
 
-### OpenMine
+### MineDetector
 
-OpenMine explores technologies that may improve humanitarian land-mine and unexploded-ordnance detection, mapping, and clearance support.
+MineDetector explores technologies that may improve humanitarian land-mine and unexploded-ordnance detection, mapping, and clearance support.
 
 Work in this area is intended to support research and humanitarian outcomes. Experimental systems must not be represented as field-ready safety equipment without appropriate validation.
 
