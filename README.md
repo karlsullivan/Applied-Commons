@@ -109,4 +109,4 @@ Applied Commons is at an early stage.
 
 The initial focus is on establishing a lightweight framework for practical, openly developed engineering work without creating unnecessary organisational overhead.
 
-The first active technical work will be developed under the OpenCarbon project, with OpenMine maintained initially as a future research stream.
+The first active technical work will be developed under the OpenCarbon project, with MineDetector maintained initially as a future research stream.
