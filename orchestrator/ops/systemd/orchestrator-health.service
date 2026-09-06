@@ -1,0 +1,9 @@
+[Unit]
+Description=Orchestrator platform health check
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+User=orchestrator
+ExecStart=/srv/orchestrator/shared/config/monitoring/healthcheck.sh
