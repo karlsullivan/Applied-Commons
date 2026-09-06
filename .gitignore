@@ -1,0 +1,20 @@
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Runtime
+*.log
+data/
+postgres/
+backups/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
