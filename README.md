@@ -73,8 +73,6 @@ Some Applied Commons projects may involve hazardous equipment, chemicals, electr
 
 Published work should be treated as experimental unless explicitly demonstrated otherwise.
 
-Projects involving humanitarian mine action or other safety-critical applications require particularly careful validation and engagement with appropriate subject-matter experts before any operational use.
-
 See `SAFETY.md` for more information.
 
 ## Licensing
