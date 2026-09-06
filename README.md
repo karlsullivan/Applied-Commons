@@ -23,20 +23,6 @@ Applied Commons is built around a few simple principles:
 
 Progress is measured in **experiments, designs, datasets, deployments, and verified outcomes — not meetings, memberships, funding, or publicity.**
 
-## Projects
-
-### OpenCarbon
-
-OpenCarbon explores practical approaches to greenhouse-gas removal, durable carbon storage, and measurement, reporting, and verification.
-
-The objective is to combine existing research, open technologies, and practical engineering into systems that can be independently built, tested, and evaluated.
-
-### MineDetector
-
-MineDetector explores technologies that may improve humanitarian land-mine and unexploded-ordnance detection, mapping, and clearance support.
-
-Work in this area is intended to support research and humanitarian outcomes. Experimental systems must not be represented as field-ready safety equipment without appropriate validation.
-
 ## How We Work
 
 Projects should move toward tangible outputs such as:
