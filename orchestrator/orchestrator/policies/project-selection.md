@@ -79,19 +79,85 @@ Set minimum effectiveness and robustness requirements before comparing cheaper a
 
 Numerical scores may assist comparison when their definitions and evidence are explicit. An unexplained model score or self-reported confidence must not decide admission, continuation or completion. Uncertainty that can be meaningfully investigated may justify deeper work.
 
+4a. Rubric v1 (autonomous admission)
+
+Admission is autonomous: the orchestrator admits candidates that meet the rule below without a human approval step (section 9). The rubric is implemented in orchestrator/app/research.py (rubric-v1); this section and that file must change together.
+
+Every candidate receives a candidate-assessment job. The assessment returns a 0 to 1 score for each assessed dimension, a written answer to each of the six section 3 requirements ("unknown" where evidence is missing), a rationale and up to five research questions.
+
+Dimension
+
+Weight
+
+Meaning
+
+Need layer
+
+0.20
+
+Fixed by the candidate's taxonomy layer: physiological 1.0, safety 0.8, belonging 0.4, esteem 0.3, self-actualisation 0.2.
+
+Need severity and reach
+
+0.20
+
+How severe and persistent the need is, and how many people it affects.
+
+Effectiveness
+
+0.15
+
+Credible improvement over the baseline in the intended setting.
+
+Ease
+
+0.15
+
+Ease of use and of implementation for the intended users.
+
+Cost
+
+0.15
+
+Affordability over the service life (section 4); higher means cheaper.
+
+Practicality
+
+0.15
+
+Practical independence: parts, skills, repair and support (section 3).
+
+The evidence score is not weighted in; it scales the result. The composite is the weighted sum multiplied by (0.5 + 0.5 × evidence), so weak evidence at most halves a candidate's score. A promising but under-evidenced candidate stays on the shortlist without being admitted on unsupported claims.
+
+A candidate is admitted when all of the following hold:
+
+The composite is at least 0.55.
+
+The evidence score is at least 0.3.
+
+The need, baseline and improvement requirements are answered, not "unknown". Demonstration, burden removed and practical independence may remain open; the admitted project investigates them.
+
+At least two sources support it, counting source URIs and recorded evidence.
+
+An active project slot is free (section 5).
+
+Eligible candidates are admitted in descending composite order. Each admission is written to the decisions table with the composite, evidence score, rationale, policy revision and the author "applied-commons orchestrator, rubric v1". Admission opens the candidate's research questions.
+
+Results that do not match the job's output format are rejected before anything is written. The scores support the section 4 judgement; the written rationale and requirement answers record why.
+
 5. Focus and project limits
 
-The initial portfolio allows:
+The portfolio runs projects in parallel, limited by available compute (section 9):
 
-One active engineering development project.
+Up to MAX_ACTIVE_PROJECTS active projects at once (default 8). Each is a feasibility investigation until it reaches a development checkpoint.
 
-One separate feasibility investigation with a defined question, deliverable and checkpoint.
+The number of concurrent research steps is limited by the executor, not by the project count. Apollo dispatches Applied Commons work only while the Spark reports itself healthy with spare capacity, and only in a bounded number of parallel steps.
 
 These limits apply across Applied Commons as a whole. Categories do not receive independent project allowances. Subprojects, supporting tools and follow-up questions retain their parent project's scope and resource accounting. A distinct independent outcome requires a separate admission decision.
 
-Keep a finite, deduplicated shortlist of candidates. Discovery must have an explicit scope and purpose, and remain subordinate to useful progress on admitted work. Do not generate or investigate projects merely to populate categories or occupy available compute.
+Keep a finite, deduplicated shortlist of candidates. Discovery has an explicit scope: one candidate-discovery step per physiological or safety category in taxonomy.md every 14 days, each returning at most 20 named open-source projects or approaches with sources. Discovery remains subordinate to useful progress on admitted work. Do not generate or investigate projects merely to populate categories or occupy available compute.
 
-Admission to an occupied development slot requires an explicit completion or parking decision for the current project. Record the reason for a switch and preserve the existing work. Temporary PlantScope interruptions retain the current project's place. Reopening parked work requires new evidence, changed constraints, a resolved blocker or a recorded maintainer decision.
+When every slot is occupied, new candidates wait on the shortlist until a project completes or is parked. Record the reason for a switch and preserve the existing work. Temporary PlantScope interruptions retain the current project's place. Reopening parked work requires new evidence, changed constraints, a resolved blocker or a recorded maintainer decision.
 
 The orchestrator enforces project limits independently of model recommendations. Changes to those limits require a maintainer decision recorded in version control.
 
@@ -166,3 +232,15 @@ For admission, switching, continuation and completion, preserve the relevant pro
 Completion applies to the stated deliverable. A completed feasibility study may still leave a physical design unvalidated. Further development requires an explicit follow-up decision; completed work must not silently expand into an indefinite new mission.
 
 Assess success through demonstrated engineering improvements, useful uncertainties resolved, burdens reduced and usable outputs. Project counts, document volume, token consumption and GPU utilisation are operational measurements, not substitutes for those outcomes.
+
+9. Maintainer decisions
+
+2026-10-05:
+
+Admission is autonomous under rubric v1 (section 4a), with no human approval step.
+
+Projects run in parallel, limited by Spark health and spare capacity (section 5). This replaces the initial limit of one development project and one feasibility investigation.
+
+Research steps are short and are not preempted. PlantScope may wait for a running step to finish, for at most about ten minutes; Apollo enforces that limit on each step.
+
+Priority follows the Maslow layer, need severity and reach, effectiveness, ease of use and implementation, cost and practicality, weighted as in section 4a.
