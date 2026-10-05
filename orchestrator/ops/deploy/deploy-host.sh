@@ -44,7 +44,8 @@ for _ in $(seq 60); do
 done
 
 for sql in "$SRC/database/schema.sql" "$SRC"/database/migrations/*.sql; do
-    docker exec -i ac-postgres psql -v ON_ERROR_STOP=1 -q \
+    docker exec -i -e PGOPTIONS=--client-min-messages=warning ac-postgres \
+        psql -v ON_ERROR_STOP=1 -q \
         -U "$POSTGRES_USER" -d "$POSTGRES_DB" < "$sql"
 done
 
