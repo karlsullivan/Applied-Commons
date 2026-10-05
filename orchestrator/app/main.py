@@ -10,6 +10,32 @@ from pydantic import BaseModel, Field
 
 DATABASE_URL = os.environ["DATABASE_URL"]
 
+# Job types reserved for one claiming worker. Apollo executes AC research
+# classes through Hermes; reserving them means no other worker (such as
+# the NUC worker) can claim them, even after a lease expires. Override with
+# JOB_TYPE_OWNERS="type=worker,type=worker" (an empty value disables it).
+DEFAULT_JOB_TYPE_OWNERS = {
+    "literature-collection": "apollo-hermes",
+    "source-summarisation": "apollo-hermes",
+    "evidence-extraction": "apollo-hermes",
+}
+
+
+def job_type_owners() -> dict[str, str]:
+    raw = os.environ.get("JOB_TYPE_OWNERS")
+    if raw is None:
+        return dict(DEFAULT_JOB_TYPE_OWNERS)
+    owners = {}
+    for pair in filter(None, (p.strip() for p in raw.split(","))):
+        job_type, _, worker = pair.partition("=")
+        if not job_type or not worker:
+            raise RuntimeError(f"invalid JOB_TYPE_OWNERS entry: {pair!r}")
+        owners[job_type.strip()] = worker.strip()
+    return owners
+
+
+QUESTION_STATUSES = ("candidate", "open", "answered", "parked")
+DISCOVERY_JOB_TYPE = "literature-collection"
 
 app = FastAPI(
     title="Applied Commons Orchestrator",
@@ -74,6 +100,26 @@ class JobHeartbeat(BaseModel):
     worker: str
 
 
+class QuestionStatus(BaseModel):
+    status: str
+
+
+class ProjectCreate(BaseModel):
+    code: str = Field(min_length=1, max_length=64)
+    name: str = Field(min_length=1, max_length=200)
+    maslow_level: int = Field(ge=1, le=5)
+    domain: str = Field(min_length=1, max_length=100)
+    status: str = Field(default="candidate", pattern="^(candidate|active|paused|parked|completed)$")
+
+
+class ProjectStatus(BaseModel):
+    status: str = Field(pattern="^(candidate|active|paused|parked|completed)$")
+
+
+class BacklogDiscover(BaseModel):
+    limit: int = Field(default=20, ge=1, le=200)
+
+
 # ---------------------------------------------------------------------------
 # Health
 # ---------------------------------------------------------------------------
@@ -115,6 +161,43 @@ def get_projects():
             )
 
             return cur.fetchall()
+
+
+@app.post("/projects")
+def create_project(item: ProjectCreate):
+    """Record a project. New projects are candidates: making one active
+    (and so eligible for backlog discovery) is an explicit status change."""
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO projects (code, name, maslow_level, domain, status)
+                VALUES (%s, %s, %s, %s, %s)
+                RETURNING id, code, name, maslow_level, domain, status, created_at;
+                """,
+                (item.code, item.name, item.maslow_level, item.domain, item.status),
+            )
+            result = cur.fetchone()
+        conn.commit()
+    return result
+
+
+@app.post("/projects/{project_id}/status")
+def set_project_status(project_id: int, item: ProjectStatus):
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE projects SET status = %s WHERE id = %s
+                RETURNING id, code, name, maslow_level, domain, status;
+                """,
+                (item.status, project_id),
+            )
+            result = cur.fetchone()
+        conn.commit()
+    if result is None:
+        raise HTTPException(status_code=404, detail="no such project")
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -178,6 +261,89 @@ def create_question(item: QuestionCreate):
         conn.commit()
 
     return result
+
+
+@app.post("/questions/{question_id}/status")
+def set_question_status(question_id: int, item: QuestionStatus):
+    """Move a question between candidate, open, answered and parked.
+
+    Only ``open`` questions in ``active`` projects are turned into research
+    jobs by backlog discovery.
+    """
+    if item.status not in QUESTION_STATUSES:
+        raise HTTPException(
+            status_code=422,
+            detail=f"status must be one of {list(QUESTION_STATUSES)}",
+        )
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE questions SET status = %s
+                WHERE id = %s
+                RETURNING id, project_id, question, status, priority;
+                """,
+                (item.status, question_id),
+            )
+            result = cur.fetchone()
+        conn.commit()
+    if result is None:
+        raise HTTPException(status_code=404, detail="no such question")
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Backlog discovery
+# ---------------------------------------------------------------------------
+
+@app.post("/backlog/discover")
+def discover_backlog(item: BacklogDiscover):
+    """Enqueue research work for existing open questions.
+
+    For each ``open`` question in an ``active`` project that has no
+    literature-collection unit yet, enqueue one, keyed by a stable unit key
+    so repeated runs never enqueue it twice. Bounded by ``limit`` and
+    ordered by question priority. Nothing is generated beyond the questions
+    already recorded: no new topics.
+    """
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO jobs (
+                    project_id, question_id, job_type, priority, input, unit_key
+                )
+                SELECT
+                    q.project_id,
+                    q.id,
+                    %(job_type)s,
+                    LEAST(GREATEST(COALESCE(q.priority, 0.5), 0), 1),
+                    jsonb_build_object(
+                        'question', q.question,
+                        'project_code', p.code,
+                        'project_name', p.name,
+                        'maslow_level', p.maslow_level,
+                        'domain', p.domain
+                    ),
+                    %(job_type)s || ':question:' || q.id
+                FROM questions q
+                JOIN projects p ON p.id = q.project_id
+                WHERE p.status = 'active'
+                  AND q.status = 'open'
+                  AND NOT EXISTS (
+                        SELECT 1 FROM jobs j
+                        WHERE j.unit_key = %(job_type)s || ':question:' || q.id
+                  )
+                ORDER BY COALESCE(q.priority, 0.5) DESC, q.id
+                LIMIT %(limit)s
+                ON CONFLICT (unit_key) WHERE unit_key IS NOT NULL DO NOTHING
+                RETURNING id, question_id, unit_key, priority;
+                """,
+                {"job_type": DISCOVERY_JOB_TYPE, "limit": item.limit},
+            )
+            created = cur.fetchall()
+        conn.commit()
+    return {"created": created}
 
 
 # ---------------------------------------------------------------------------
@@ -268,6 +434,17 @@ def claim_job(item: JobClaim):
         raise HTTPException(
             status_code=400,
             detail="job_types must contain at least one job type",
+        )
+
+    owners = job_type_owners()
+    foreign = sorted(
+        t for t in item.job_types
+        if t in owners and owners[t] != item.worker
+    )
+    if foreign:
+        raise HTTPException(
+            status_code=403,
+            detail=f"job types reserved for another worker: {foreign}",
         )
 
     with db() as conn:
