@@ -1,0 +1,7 @@
+[Unit]
+Description=Applied Commons backlog discovery (open questions -> research jobs)
+
+[Service]
+Type=oneshot
+Environment=AC_API_URL=http://127.0.0.1:8100
+ExecStart=/usr/bin/curl -fsS -X POST -H "Content-Type: application/json" -d "{\"limit\": 20}" ${AC_API_URL}/backlog/discover

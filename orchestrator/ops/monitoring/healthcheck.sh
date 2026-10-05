@@ -19,7 +19,7 @@ docker ps \
   >> "$LOG"
 
 echo "--- APPLIED COMMONS API ---" >> "$LOG"
-if curl -fsS http://127.0.0.1:8000/health >> "$LOG"; then
+if curl -fsS "${AC_API_URL:-http://127.0.0.1:8100}/health" >> "$LOG"; then
     echo >> "$LOG"
 else
     echo "ERROR: Applied Commons API unavailable" >> "$LOG"
