@@ -21,7 +21,7 @@ Applied Commons is built around a few simple principles:
 * Keep public-benefit work available for non-commercial use.
 * Treat commercialisation as a means to scale impact where appropriate, not as the primary objective.
 
-Progress is measured in **experiments, designs, datasets, deployments, and verified outcomes — not meetings, memberships, funding, or publicity.**
+Progress is measured in tangibles. We measure ourselves on **experiments, designs, datasets, deployments, and verified outcomes. We are not interested in meetings, memberships, funding, or publicity.**
 
 ## How We Work
 
