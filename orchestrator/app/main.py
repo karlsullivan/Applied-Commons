@@ -49,6 +49,17 @@ class JobClaim(BaseModel):
     job_types: list[str]
 
 
+class FindingIn(BaseModel):
+    finding: str = Field(min_length=1, max_length=4000)
+    confidence: float = Field(ge=0.0, le=1.0)
+
+
+class EvidenceIn(BaseModel):
+    source_uri: str = Field(pattern=r"^https?://", max_length=2000)
+    title: str | None = Field(default=None, max_length=500)
+    source_type: str | None = Field(default=None, max_length=100)
+
+
 class JobComplete(BaseModel):
     worker: str
     output: dict[str, Any] = Field(default_factory=dict)
@@ -57,6 +68,10 @@ class JobComplete(BaseModel):
 class JobFail(BaseModel):
     worker: str
     error: str
+
+
+class JobHeartbeat(BaseModel):
+    worker: str
 
 
 # ---------------------------------------------------------------------------
@@ -312,11 +327,70 @@ def claim_job(item: JobClaim):
 
 
 # ---------------------------------------------------------------------------
+# Job lease heartbeat
+# ---------------------------------------------------------------------------
+
+@app.post("/jobs/{job_id}/heartbeat")
+def heartbeat_job(job_id: int, item: JobHeartbeat):
+    """Renew the lease of a running job, owner-checked.
+
+    Long-running executors (Apollo/Hermes) call this while a job runs so
+    its lease does not lapse and let another worker re-claim it.
+    """
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE jobs
+                SET lease_until = NOW() + INTERVAL '15 minutes'
+                WHERE id = %s
+                  AND status = 'running'
+                  AND worker = %s
+                RETURNING id, status, worker, attempts, lease_until;
+                """,
+                (
+                    job_id,
+                    item.worker,
+                ),
+            )
+
+            result = cur.fetchone()
+
+        conn.commit()
+
+    if result is None:
+        raise HTTPException(
+            status_code=409,
+            detail="Job is not running or is not owned by this worker",
+        )
+
+    return {
+        "job": result,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Job completion
 # ---------------------------------------------------------------------------
 
 @app.post("/jobs/{job_id}/complete")
 def complete_job(job_id: int, item: JobComplete):
+    # Optional structured results: findings and evidence carried in the
+    # output are validated here and stored in the same transaction as
+    # the completion, so a completed job and its results commit together.
+    try:
+        findings = [
+            FindingIn(**f) for f in item.output.get("findings") or []
+        ]
+        evidence = [
+            EvidenceIn(**e) for e in item.output.get("evidence") or []
+        ]
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(
+            status_code=422,
+            detail=f"invalid findings/evidence: {exc}",
+        ) from exc
+
     with db() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -342,6 +416,39 @@ def complete_job(job_id: int, item: JobComplete):
 
             result = cur.fetchone()
 
+            if result is not None:
+                for f in findings:
+                    cur.execute(
+                        """
+                        INSERT INTO findings (
+                            project_id, question_id, finding, confidence
+                        )
+                        VALUES (%s, %s, %s, %s);
+                        """,
+                        (
+                            result["project_id"],
+                            result["question_id"],
+                            f.finding,
+                            f.confidence,
+                        ),
+                    )
+                for e in evidence:
+                    cur.execute(
+                        """
+                        INSERT INTO evidence (
+                            project_id, source_uri, title, source_type, metadata
+                        )
+                        VALUES (%s, %s, %s, %s, %s);
+                        """,
+                        (
+                            result["project_id"],
+                            e.source_uri,
+                            e.title,
+                            e.source_type,
+                            Jsonb({"job_id": job_id, "worker": item.worker}),
+                        ),
+                    )
+
         conn.commit()
 
     if result is None:
@@ -352,6 +459,8 @@ def complete_job(job_id: int, item: JobComplete):
 
     return {
         "job": result,
+        "findings": len(findings),
+        "evidence": len(evidence),
     }
 
 
