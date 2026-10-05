@@ -506,6 +506,64 @@ def portfolio():
     return {"projects": projects, "decisions": decisions}
 
 
+def _counts(cur, query: str) -> dict[str, int]:
+    cur.execute(query)
+    return {row["key"]: row["n"] for row in cur.fetchall()}
+
+
+@app.get("/summary")
+def summary():
+    """Stage counts for an operator overview: the research pipeline from
+    need categories to findings, and the job queue. Read-only."""
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    (SELECT count(*) FROM need_categories) AS need_categories,
+                    (SELECT count(DISTINCT category_id) FROM projects
+                       WHERE category_id IS NOT NULL) AS categories_with_candidates,
+                    (SELECT count(*) FROM projects) AS projects,
+                    (SELECT count(DISTINCT project_id) FROM assessments) AS assessed,
+                    (SELECT count(*) FROM questions) AS questions,
+                    (SELECT count(*) FROM findings) AS findings,
+                    (SELECT count(*) FROM evidence) AS evidence,
+                    (SELECT count(*) FROM jobs WHERE status = 'completed'
+                       AND completed_at > NOW() - INTERVAL '24 hours') AS jobs_completed_24h,
+                    (SELECT count(*) FROM jobs WHERE status = 'failed'
+                       AND completed_at > NOW() - INTERVAL '24 hours') AS jobs_failed_24h
+                """
+            )
+            totals = cur.fetchone()
+            projects = _counts(cur, "SELECT status AS key, count(*) AS n FROM projects GROUP BY 1")
+            questions = _counts(cur, "SELECT status AS key, count(*) AS n FROM questions GROUP BY 1")
+            decisions = _counts(cur, "SELECT decision AS key, count(*) AS n FROM decisions GROUP BY 1")
+            cur.execute(
+                "SELECT job_type, status, count(*) AS n FROM jobs GROUP BY 1, 2 ORDER BY 1, 2"
+            )
+            jobs: dict[str, dict[str, int]] = {}
+            for row in cur.fetchall():
+                jobs.setdefault(row["job_type"], {})[row["status"]] = row["n"]
+    return {
+        "pipeline": {
+            "need_categories": totals["need_categories"],
+            "categories_with_candidates": totals["categories_with_candidates"],
+            "candidates": totals["projects"],
+            "assessed": totals["assessed"],
+            "admitted": projects.get("active", 0),
+            "questions": totals["questions"],
+            "findings": totals["findings"],
+            "evidence": totals["evidence"],
+        },
+        "projects_by_status": projects,
+        "questions_by_status": questions,
+        "decisions": decisions,
+        "jobs": jobs,
+        "jobs_completed_24h": totals["jobs_completed_24h"],
+        "jobs_failed_24h": totals["jobs_failed_24h"],
+    }
+
+
 # ---------------------------------------------------------------------------
 # Jobs
 # ---------------------------------------------------------------------------

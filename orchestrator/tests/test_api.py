@@ -432,3 +432,27 @@ def test_portfolio_ranks_projects(client):
     assert [p["name"] for p in body["projects"]][:1] == ["Filter B"]
     assert body["projects"][0]["status"] == "active"
     assert body["decisions"][0]["decision"] == "admit"
+
+
+def test_summary_counts_the_pipeline_and_the_queue(client):
+    empty = client.get("/summary").json()
+    assert empty["pipeline"]["candidates"] == 0
+    assert empty["pipeline"]["need_categories"] == 20
+
+    discover(client, limit=1)
+    run_job(client, "candidate-discovery", candidates("Filter A", "Filter B"))
+    discover(client)
+    run_job(client, "candidate-assessment", strong_assessment())
+    discover(client)
+    body = client.get("/summary").json()
+    pipeline = body["pipeline"]
+    assert pipeline["categories_with_candidates"] == 1
+    assert pipeline["candidates"] == 2
+    assert pipeline["assessed"] == 1
+    assert pipeline["admitted"] == 1
+    assert pipeline["questions"] >= 1
+    assert body["projects_by_status"]["active"] == 1
+    assert body["decisions"]["admit"] == 1
+    assert body["jobs"]["candidate-discovery"]["completed"] == 1
+    assert body["jobs_completed_24h"] == 2
+    assert body["jobs_failed_24h"] == 0
