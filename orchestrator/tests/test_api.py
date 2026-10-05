@@ -218,9 +218,11 @@ def test_discovery_enqueues_open_questions_in_active_projects_only(client):
     created = client.post("/backlog/discover", json={}).json()["created"]
     assert [(c["question_id"], c["unit_key"]) for c in created] == [
         (q_open, f"literature-collection:question:{q_open}")]
-    [(job_type, priority, payload)] = sql("SELECT job_type, priority, input FROM jobs")
-    assert job_type == "literature-collection" and priority == 0.9
+    [(priority, payload)] = sql(
+        "SELECT priority, input FROM jobs WHERE job_type = 'literature-collection'")
+    assert priority == 0.9
     assert payload["question"] == "open q" and payload["project_code"] == "A"
+    assert "instructions" in payload and "output_format" in payload
 
 
 def test_discovery_is_idempotent_bounded_and_progresses(client):
@@ -232,7 +234,7 @@ def test_discovery_is_idempotent_bounded_and_progresses(client):
     second = client.post("/backlog/discover", json={"limit": 2}).json()["created"]
     assert [c["question_id"] for c in second] == [ids[0]]
     assert client.post("/backlog/discover", json={}).json()["created"] == []
-    assert sql("SELECT count(*) FROM jobs") == [(3,)]
+    assert sql("SELECT count(*) FROM jobs WHERE job_type = 'literature-collection'") == [(3,)]
 
 
 def test_completed_or_failed_units_are_not_rediscovered(client):
@@ -243,9 +245,190 @@ def test_completed_or_failed_units_are_not_rediscovered(client):
     assert client.post("/backlog/discover", json={}).json()["created"] == []
 
 
+def test_discovered_jobs_are_claimable(client):
+    pid = project(client)
+    question(client, pid, "q")
+    [created] = client.post("/backlog/discover", json={}).json()["created"]
+    claimed = claim(client, APOLLO, ["literature-collection"]).json()["job"]
+    assert claimed["id"] == created["id"]
+
+
 def test_status_endpoints_validate(client):
     pid = project(client)
     qid = question(client, pid, "q", status="candidate")
     assert client.post(f"/questions/{qid}/status", json={"status": "bogus"}).status_code == 422
     assert client.post("/questions/999/status", json={"status": "open"}).status_code == 404
     assert client.post(f"/projects/{pid}/status", json={"status": "bogus"}).status_code == 422
+
+
+# ---------------------------------------------------------------------------
+# Autonomous research pipeline (rubric v1)
+# ---------------------------------------------------------------------------
+
+FOCUS_CATEGORIES = 14  # layers 1 and 2 of the needs taxonomy
+
+
+def discover(client, limit=200):
+    return client.post("/backlog/discover", json={"limit": limit}).json()
+
+
+def run_job(client, job_type, output):
+    """Claim the next job of a type as Apollo and complete it."""
+    job = claim(client, APOLLO, [job_type]).json()["job"]
+    assert job is not None, job_type
+    response = client.post(f"/jobs/{job['id']}/complete",
+                           json={"worker": APOLLO, "output": output})
+    return job, response
+
+
+def strong_assessment(**overrides):
+    scores = {"need_severity_reach": 0.9, "effectiveness": 0.8, "ease": 0.8,
+              "cost": 0.9, "practicality": 0.8, "evidence": 0.6}
+    scores.update(overrides)
+    return {
+        "summary": "s",
+        "assessment": {
+            "scores": scores,
+            "requirements": {
+                "need": "Households lack safe water.",
+                "baseline": "Boiling, costly chlorine.",
+                "improvement": "Removes 99% of bacteria at low cost.",
+                "demonstration": "unknown", "burden_removed": "unknown",
+                "practical_independence": "unknown",
+            },
+            "rationale": "Field reports show sustained use in several regions.",
+            "questions": ["What flow rate does the filter sustain over a year?"],
+        },
+        "evidence": [{"source_uri": "https://example.org/field-report"}],
+    }
+
+
+def candidates(*names):
+    return {"summary": "s", "candidates": [
+        {"name": n, "summary": f"{n} is an open design.",
+         "source_uris": [f"https://example.org/{research_slug(n)}"]}
+        for n in names]}
+
+
+def research_slug(name):
+    return name.lower().replace(" ", "-")
+
+
+def test_discovery_scans_each_focus_category_once_per_period(client):
+    first = discover(client)["discovery"]
+    assert len(first) == FOCUS_CATEGORIES
+    assert discover(client)["discovery"] == []
+    [(payload,)] = sql(
+        "SELECT input FROM jobs WHERE job_type = 'candidate-discovery' "
+        "ORDER BY id LIMIT 1")
+    assert payload["category"] == "Air and breathing" and payload["layer"] == 1
+    assert "instructions" in payload and payload["already_known"] == []
+    assert sql("SELECT count(*) FROM jobs j JOIN need_categories c "
+               "ON c.id = (j.input->>'category_id')::bigint WHERE c.layer > 2") == [(0,)]
+
+
+def test_discovery_results_become_deduplicated_candidates(client):
+    discover(client, limit=1)
+    job, r = run_job(client, "candidate-discovery",
+                     candidates("Slow Sand Filter", "slow sand filter", "Ceramic Pot Filter"))
+    assert r.status_code == 200 and r.json()["candidates"] == 2
+    rows = sql("SELECT name, status, maslow_level, category_id, discovered_by_job "
+               "FROM projects ORDER BY id")
+    assert [(n, s) for n, s, *_ in rows] == [
+        ("Slow Sand Filter", "candidate"), ("Ceramic Pot Filter", "candidate")]
+    assert all(row[3] == job["input"]["category_id"] and row[4] == job["id"] for row in rows)
+
+
+def test_assessment_admission_and_research_run_autonomously(client):
+    discover(client, limit=1)
+    run_job(client, "candidate-discovery", candidates("Slow Sand Filter"))
+    assert len(discover(client)["assessment"]) == 1
+    _, r = run_job(client, "candidate-assessment", strong_assessment())
+    assert r.status_code == 200 and r.json()["questions"] == 1
+    composite = r.json()["composite"]
+    assert composite >= 0.55
+
+    step = discover(client)
+    [admitted] = step["admitted"]
+    assert admitted["composite"] == composite
+    [(status, score)] = sql("SELECT status, score FROM projects")
+    assert status == "active" and score == composite
+    [(decision, author, revision)] = sql(
+        "SELECT decision, author, policy_revision FROM decisions")
+    assert decision == "admit" and "rubric v1" in author and "rubric v1" in revision
+    # The admitted project's question was opened and its research queued.
+    [created] = step["created"]
+    assert sql("SELECT status FROM questions") == [("open",)]
+    assert created["unit_key"].startswith("literature-collection:question:")
+
+
+@pytest.mark.parametrize("change", [
+    {"scores": {"cost": 0.1, "ease": 0.1, "practicality": 0.1, "effectiveness": 0.1}},
+    {"scores": {"evidence": 0.1}},
+    {"requirement": "need"},
+])
+def test_weak_cases_are_not_admitted(client, change):
+    discover(client, limit=1)
+    run_job(client, "candidate-discovery", candidates("Slow Sand Filter"))
+    discover(client)
+    output = strong_assessment(**change.get("scores", {}))
+    if "requirement" in change:
+        output["assessment"]["requirements"][change["requirement"]] = "unknown"
+    run_job(client, "candidate-assessment", output)
+    assert discover(client)["admitted"] == []
+    assert sql("SELECT status FROM projects") == [("candidate",)]
+
+
+def test_admission_respects_the_active_project_limit(client, monkeypatch):
+    monkeypatch.setenv("MAX_ACTIVE_PROJECTS", "1")
+    discover(client, limit=1)
+    run_job(client, "candidate-discovery", candidates("Filter A", "Filter B"))
+    discover(client)
+    run_job(client, "candidate-assessment", strong_assessment(cost=0.6))
+    run_job(client, "candidate-assessment", strong_assessment(cost=1.0))
+    [admitted] = discover(client)["admitted"]
+    assert sql("SELECT name FROM projects WHERE status = 'active'") == [("Filter B",)]
+    assert discover(client)["admitted"] == []
+
+
+@pytest.mark.parametrize("job_type, output", [
+    ("candidate-discovery", {"candidates": [{"name": "X", "summary": "s",
+                                             "source_uris": []}]}),
+    ("candidate-discovery", {"candidates": [{"name": "Valid name", "summary": "long enough",
+                                             "source_uris": ["ftp://x"]}]}),
+    ("candidate-assessment", {"assessment": {"scores": {"cost": 2}, "requirements": {},
+                                             "rationale": "r"}}),
+])
+def test_invalid_pipeline_results_write_nothing(client, job_type, output):
+    discover(client, limit=1)
+    if job_type == "candidate-assessment":
+        run_job(client, "candidate-discovery", candidates("Slow Sand Filter"))
+        discover(client)
+    before = sql("SELECT count(*) FROM projects")
+    job, r = run_job(client, job_type, output)
+    assert r.status_code == 422
+    assert sql("SELECT count(*) FROM projects") == before
+    assert sql("SELECT count(*) FROM assessments") == [(0,)]
+    assert sql("SELECT status FROM jobs WHERE id = %s", job["id"]) == [("running",)]
+
+
+def test_composite_scoring():
+    import research
+
+    top = {d: 1.0 for d in research.ASSESSED_DIMENSIONS}
+    assert research.composite_score(1, top) == 1.0
+    assert research.composite_score(1, {**top, "evidence": 0.0}) == 0.5
+    assert research.composite_score(5, top) < research.composite_score(1, top)
+
+
+def test_portfolio_ranks_projects(client):
+    discover(client, limit=1)
+    run_job(client, "candidate-discovery", candidates("Filter A", "Filter B"))
+    discover(client)
+    run_job(client, "candidate-assessment", strong_assessment(evidence=0.1))
+    run_job(client, "candidate-assessment", strong_assessment())
+    discover(client)
+    body = client.get("/portfolio").json()
+    assert [p["name"] for p in body["projects"]][:1] == ["Filter B"]
+    assert body["projects"][0]["status"] == "active"
+    assert body["decisions"][0]["decision"] == "admit"
