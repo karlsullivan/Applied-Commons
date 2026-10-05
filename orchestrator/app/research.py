@@ -145,7 +145,8 @@ class AssessmentResult(BaseModel):
 _COMMON = (
     "Use web search and page extraction. Work only from sources you actually "
     "retrieved; cite their URLs. Never invent projects, sources, measurements "
-    "or results. Be brief: finish within eight minutes."
+    "or results. Be concise: prefer a few well-sourced results over many "
+    "weak ones."
 )
 
 
