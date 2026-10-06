@@ -1,0 +1,10 @@
+[Unit]
+Description=Archive Applied Commons design files every 30 minutes
+
+[Timer]
+OnActiveSec=5min
+OnUnitActiveSec=30min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

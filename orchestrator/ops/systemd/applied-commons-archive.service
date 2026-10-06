@@ -1,0 +1,10 @@
+[Unit]
+Description=Applied Commons design archive (build pack design files -> pinned local copies)
+
+[Service]
+Type=oneshot
+Environment=AC_API_URL=http://127.0.0.1:8100
+Environment=AC_EXPORTS=/srv/orchestrator/tenants/applied-commons/exports
+ExecStart=/usr/bin/python3 /srv/orchestrator/tenants/applied-commons/workspaces/Applied-Commons/orchestrator/ops/archive/archive_designs.py
+TimeoutStartSec=2h
+Nice=10

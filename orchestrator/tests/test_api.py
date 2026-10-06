@@ -314,7 +314,52 @@ def research_slug(name):
     return name.lower().replace(" ", "-")
 
 
+BRIEF = {
+    "users": "Rural households without piped water, about 2 billion people.",
+    "severity": "Unsafe water causes about 500,000 diarrhoeal deaths a year.",
+    "current_practice": "Boiling with firewood or buying bottled water.",
+    "requirements": ["Removes 99% of E. coli", "Treats 20 L per day"],
+    "constraints": ["Under US$50 in materials"],
+    "gaps": "Filters clog and spare parts are hard to find.",
+}
+
+
+def seed_briefs():
+    """A need brief for every focus category, so discovery can start."""
+    from psycopg.types.json import Jsonb
+
+    sql("INSERT INTO need_briefs (category_id, brief) "
+        "SELECT id, %s FROM need_categories WHERE layer <= 2", Jsonb(BRIEF))
+
+
+def test_briefs_come_first_and_gate_discovery(client):
+    first = discover(client)
+    assert len(first["briefs"]) == FOCUS_CATEGORIES and first["discovery"] == []
+    assert discover(client)["briefs"] == []  # one brief job per category per period
+    job, r = run_job(client, "need-brief", {"summary": "s", "brief": BRIEF,
+                                            "evidence": [{"source_uri": "https://who.int/x"}]})
+    assert r.status_code == 200, r.text
+    assert job["input"]["category"] == "Air and breathing"
+    assert "instructions" in job["input"] and "output_format" in job["input"]
+    [(stored,)] = sql("SELECT brief FROM need_briefs")
+    assert stored["requirements"] == BRIEF["requirements"]
+
+    [discovery] = discover(client)["discovery"]  # only the briefed category
+    assert discovery["unit_key"].startswith(f"candidate-discovery:category:{job['input']['category_id']}:")
+    [(payload,)] = sql("SELECT input FROM jobs WHERE job_type = 'candidate-discovery'")
+    assert payload["need_brief"] == stored and "need brief" in payload["instructions"]
+    assert [b["name"] for b in client.get("/briefs").json()] == ["Air and breathing"]
+
+
+def test_invalid_brief_writes_nothing(client):
+    discover(client)
+    _, r = run_job(client, "need-brief", {"summary": "s", "brief": {**BRIEF, "requirements": []}})
+    assert r.status_code == 422
+    assert sql("SELECT count(*) FROM need_briefs") == [(0,)]
+
+
 def test_discovery_scans_each_focus_category_once_per_period(client):
+    seed_briefs()
     first = discover(client)["discovery"]
     assert len(first) == FOCUS_CATEGORIES
     assert discover(client)["discovery"] == []
@@ -328,6 +373,7 @@ def test_discovery_scans_each_focus_category_once_per_period(client):
 
 
 def test_discovery_results_become_deduplicated_candidates(client):
+    seed_briefs()
     discover(client, limit=1)
     job, r = run_job(client, "candidate-discovery",
                      candidates("Slow Sand Filter", "slow sand filter", "Ceramic Pot Filter"))
@@ -340,6 +386,7 @@ def test_discovery_results_become_deduplicated_candidates(client):
 
 
 def test_assessment_admission_and_research_run_autonomously(client):
+    seed_briefs()
     discover(client, limit=1)
     run_job(client, "candidate-discovery", candidates("Slow Sand Filter"))
     assert len(discover(client)["assessment"]) == 1
@@ -368,6 +415,7 @@ def test_assessment_admission_and_research_run_autonomously(client):
     {"requirement": "need"},
 ])
 def test_weak_cases_are_not_admitted(client, change):
+    seed_briefs()
     discover(client, limit=1)
     run_job(client, "candidate-discovery", candidates("Slow Sand Filter"))
     discover(client)
@@ -381,6 +429,7 @@ def test_weak_cases_are_not_admitted(client, change):
 
 def test_admission_respects_the_active_project_limit(client, monkeypatch):
     monkeypatch.setenv("MAX_ACTIVE_PROJECTS", "1")
+    seed_briefs()
     discover(client, limit=1)
     run_job(client, "candidate-discovery", candidates("Filter A", "Filter B"))
     discover(client)
@@ -400,6 +449,7 @@ def test_admission_respects_the_active_project_limit(client, monkeypatch):
                                              "rationale": "r"}}),
 ])
 def test_invalid_pipeline_results_write_nothing(client, job_type, output):
+    seed_briefs()
     discover(client, limit=1)
     if job_type == "candidate-assessment":
         run_job(client, "candidate-discovery", candidates("Slow Sand Filter"))
@@ -422,6 +472,7 @@ def test_composite_scoring():
 
 
 def test_portfolio_ranks_projects(client):
+    seed_briefs()
     discover(client, limit=1)
     run_job(client, "candidate-discovery", candidates("Filter A", "Filter B"))
     discover(client)
@@ -439,6 +490,7 @@ def test_summary_counts_the_pipeline_and_the_queue(client):
     assert empty["pipeline"]["candidates"] == 0
     assert empty["pipeline"]["need_categories"] == 20
 
+    seed_briefs()
     discover(client, limit=1)
     run_job(client, "candidate-discovery", candidates("Filter A", "Filter B"))
     discover(client)
@@ -456,3 +508,205 @@ def test_summary_counts_the_pipeline_and_the_queue(client):
     assert body["jobs"]["candidate-discovery"]["completed"] == 1
     assert body["jobs_completed_24h"] == 2
     assert body["jobs_failed_24h"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Go/no-go review, build packs, steering and design archives
+# ---------------------------------------------------------------------------
+
+FINDINGS = {"summary": "s",
+            "findings": [{"finding": "Sustains 50 L/h for a year", "confidence": 0.7}],
+            "evidence": [{"source_uri": "https://example.org/flow-study"}]}
+
+BUILD = {
+    "bom": {"items": [{"part": "Washed sand", "quantity": "50 kg", "unit_cost": 0.2,
+                       "currency": "USD", "source_uri": "https://example.org/sand"}],
+            "total_cost": 10, "currency": "USD", "cost_basis": "US retail, 2026"},
+    "design": {"repositories": [{"url": "https://github.com/example/filter",
+                                 "commit": "abc123", "licence": "CERN-OHL-S-2.0"}],
+               "files": [{"name": "Drawing", "kind": "drawing",
+                          "uri": "https://example.org/drawing.pdf", "format": "PDF",
+                          "licence": "CC-BY-4.0"}]},
+    "assembly": {"tools": ["Shovel"], "steps": [{"step": "Wash the sand"}]},
+    "test": {"acceptance": [{"criterion": "Flow", "method": "Timed fill",
+                             "target": ">= 40 L/h"}]},
+}
+
+
+def admitted_project(client, questions=("What flow rate does the filter sustain?",)):
+    """Run the pipeline up to an admitted project with open questions."""
+    seed_briefs()
+    discover(client, limit=1)
+    run_job(client, "candidate-discovery", candidates("Slow Sand Filter"))
+    discover(client)
+    output = strong_assessment()
+    output["assessment"]["questions"] = list(questions)
+    run_job(client, "candidate-assessment", output)
+    assert len(discover(client)["admitted"]) == 1
+    [(pid,)] = sql("SELECT id FROM projects")
+    return pid
+
+
+def review_output(decision="build", questions=(), **scores):
+    values = {"need_severity_reach": 0.9, "effectiveness": 0.8, "ease": 0.8,
+              "cost": 0.9, "practicality": 0.8, "evidence": 0.7}
+    values.update(scores)
+    return {"summary": "s", "review": {
+        "decision": decision, "scores": values, "fit": "Meets the flow requirement.",
+        "rationale": "Field data supports documenting a full build.",
+        "gaps": ["No enclosure drawing"], "questions": list(questions)}}
+
+
+def run_build_section(client):
+    job = claim(client, APOLLO, ["build-pack"]).json()["job"]
+    section = job["input"]["section"]
+    r = client.post(f"/jobs/{job['id']}/complete", json={"worker": APOLLO, "output": {
+        "summary": "s", "build": {**BUILD[section], "gaps": [f"{section} gap"]}}})
+    assert r.status_code == 200, r.text
+    return section
+
+
+def test_research_answers_questions_then_a_review_is_queued(client):
+    pid = admitted_project(client, questions=("Question one about flow?", "Question two on cost?"))
+    run_job(client, "literature-collection", FINDINGS)
+    assert sorted(s for (s,) in sql("SELECT status FROM questions")) == ["answered", "open"]
+    assert discover(client)["reviews"] == []  # one question still open
+    run_job(client, "literature-collection", FINDINGS)
+    [review] = discover(client)["reviews"]
+    assert review["unit_key"] == f"project-review:project:{pid}:1"
+    [(payload,)] = sql("SELECT input FROM jobs WHERE job_type = 'project-review'")
+    assert payload["need_brief"] == BRIEF and payload["review_number"] == 1
+    assert payload["findings"][0]["finding"] == "Sustains 50 L/h for a year"
+    assert "https://example.org/flow-study" in payload["sources"]
+    assert discover(client)["reviews"] == []  # idempotent
+
+
+def test_failed_research_does_not_block_the_review(client):
+    admitted_project(client)
+    sql("UPDATE jobs SET status = 'failed' WHERE job_type = 'literature-collection'")
+    assert len(discover(client)["reviews"]) == 1
+
+
+def test_build_decision_runs_a_build_pack_to_completion(client):
+    pid = admitted_project(client)
+    run_job(client, "literature-collection", FINDINGS)
+    discover(client)
+    _, r = run_job(client, "project-review", review_output("build"))
+    assert r.json()["outcome"] == "build", r.text
+    builds = discover(client)["builds"]
+    assert sorted(b["unit_key"].rsplit(":", 1)[1] for b in builds) == sorted(BUILD)
+    assert client.get("/catalogue").json()["projects"][0]["stage"] == "build pack"
+    for _ in BUILD:
+        run_build_section(client)
+    [done] = discover(client)["completed"]
+    assert done == {"project_id": pid, "failed_sections": 0}
+    record = client.get(f"/projects/{pid}/record").json()
+    assert record["project"]["stage"] == "built" and record["project"]["status"] == "completed"
+    assert record["build"]["bom"]["items"][0]["part"] == "Washed sand"
+    assert record["build"]["test"]["gaps"] == ["test gap"]
+    assert [d["decision"] for d in record["decisions"]] == ["admit", "build", "complete"]
+    assert record["reviews"][0]["outcome"] == "build"
+    assert record["questions"][0]["status"] == "answered"
+    assert record["questions"][0]["findings"][0]["confidence"] == 0.7
+    assert record["brief"] == BRIEF
+
+
+def test_weak_build_recommendation_continues_with_new_questions(client):
+    pid = admitted_project(client)
+    run_job(client, "literature-collection", FINDINGS)
+    discover(client)
+    _, r = run_job(client, "project-review", review_output(
+        "build", questions=["What is the flow after six months?"], evidence=0.2))
+    assert r.json()["outcome"] == "continue"
+    step = discover(client)
+    assert step["builds"] == [] and len(step["created"]) == 1  # the new question's research
+    run_job(client, "literature-collection", FINDINGS)
+    [review] = discover(client)["reviews"]
+    assert review["unit_key"] == f"project-review:project:{pid}:2"
+
+
+def test_park_decision_parks_the_project(client):
+    pid = admitted_project(client)
+    run_job(client, "literature-collection", FINDINGS)
+    discover(client)
+    _, r = run_job(client, "project-review", review_output("park"))
+    assert r.json()["outcome"] == "park"
+    assert sql("SELECT status FROM projects WHERE id = %s", pid) == [("parked",)]
+    assert client.get("/catalogue").json()["projects"][0]["stage"] == "parked"
+
+
+def test_review_outcome_rules():
+    import research
+
+    review = research.Review(**review_output("build")["review"])
+    assert research.review_outcome(1, review, 1)[0] == "build"
+    weak = research.Review(**review_output("build", evidence=0.2)["review"])
+    assert research.review_outcome(1, weak, 1)[0] == "park"  # weak and no questions
+    asking = research.Review(**review_output("continue", questions=["Is the flow stable?"])["review"])
+    assert research.review_outcome(1, asking, 1)[0] == "continue"
+    assert research.review_outcome(1, asking, research.MAX_REVIEWS)[0] == "park"
+    parked = research.Review(**review_output("park")["review"])
+    assert research.review_outcome(1, parked, 1)[0] == "park"
+
+
+@pytest.mark.parametrize("section, body", [
+    ("bom", {"items": []}),
+    ("design", {"repositories": [{"url": "http://insecure.example/repo"}]}),
+    ("assembly", {"tools": ["x"]}),
+])
+def test_invalid_build_sections_write_nothing(client, section, body):
+    pid = project(client)
+    job_id = client.post("/jobs", json={"project_id": pid, "job_type": "build-pack",
+                                        "input": {"section": section}}).json()["id"]
+    claim(client, APOLLO, ["build-pack"])
+    r = client.post(f"/jobs/{job_id}/complete", json={
+        "worker": APOLLO, "output": {"summary": "s", "build": body}})
+    assert r.status_code == 422
+    assert sql("SELECT count(*) FROM build_packs") == [(0,)]
+
+
+def test_steer_build_and_park(client):
+    seed_briefs()
+    discover(client, limit=1)
+    run_job(client, "candidate-discovery", candidates("Filter A", "Filter B"))
+    [(a,), (b,)] = sql("SELECT id FROM projects ORDER BY id")
+    r = client.post(f"/projects/{a}/steer", json={"steer": "build", "note": "I want this"})
+    assert r.status_code == 200 and r.json()["steer"] == "build"
+    client.post(f"/projects/{b}/steer", json={"steer": "park"})
+    step = discover(client)
+    assert sorted(s["steer"] for s in step["steered"]) == ["build", "park"]
+    assert len(step["builds"]) == len(BUILD)  # straight to the build pack
+    assert sql("SELECT id, status FROM projects ORDER BY id") == [(a, "active"), (b, "parked")]
+    [(author, rationale)] = sql(
+        "SELECT author, rationale FROM decisions WHERE project_id = %s", a)
+    assert author == "maintainer (steer)" and "I want this" in rationale
+    assert discover(client)["steered"] == []  # applied once
+    assert client.post("/projects/999/steer", json={"steer": "park"}).status_code == 404
+    assert client.post(f"/projects/{a}/steer", json={"steer": "maybe"}).status_code == 422
+
+
+def test_design_sources_are_listed_for_archiving_once(client):
+    from psycopg.types.json import Jsonb
+
+    pid = project(client)
+    sql("INSERT INTO build_packs (project_id, section, content) VALUES (%s, 'design', %s)",
+        pid, Jsonb(BUILD["design"]))
+    pending = client.get("/archives/pending").json()
+    assert [(p["kind"], p["source_uri"], p["revision"]) for p in pending] == [
+        ("git", "https://github.com/example/filter", "abc123"),
+        ("file", "https://example.org/drawing.pdf", "")]
+    r = client.post("/archives", json={
+        "project_id": pid, "source_uri": "https://github.com/example/filter", "kind": "git",
+        "revision": "abc123", "resolved_revision": "abc123" + "0" * 34,
+        "licence": "CERN-OHL", "status": "archived", "path": "/x.tar.gz", "bytes": 10,
+        "sha256": "a" * 64})
+    assert r.status_code == 200, r.text
+    client.post("/archives", json={
+        "project_id": pid, "source_uri": "https://example.org/drawing.pdf", "kind": "file",
+        "status": "failed", "note": "timeout"})
+    assert client.get("/archives/pending").json() == []
+    sql("UPDATE design_archives SET created_at = NOW() - INTERVAL '2 days' "
+        "WHERE status = 'failed'")
+    assert [p["kind"] for p in client.get("/archives/pending").json()] == ["file"]  # retried
+    record = client.get(f"/projects/{pid}/record").json()
+    assert {a["status"] for a in record["archives"]} == {"archived", "failed"}

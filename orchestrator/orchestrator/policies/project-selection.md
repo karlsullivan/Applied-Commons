@@ -145,6 +145,42 @@ Eligible candidates are admitted in descending composite order. Each admission i
 
 Results that do not match the job's output format are rejected before anything is written. The scores support the section 4 judgement; the written rationale and requirement answers record why.
 
+Need first. Before candidates are sought for a focus category, a need-brief job establishes the need itself: who lacks it met and where, its severity, current practice and its cost, measurable requirements a good solution must meet, practical constraints, and where existing solutions fall short. Discovery in a category waits for its brief, and discovery and assessment judge candidates against it. Briefs are refreshed every 90 days.
+
+4b. Go/no-go review (review v1)
+
+Admission buys a project its research questions, not a build. Once every open question of an admitted project is settled (answered, or its research failed for good), a project-review job re-scores the project on the rubric with the evidence gathered, states how it meets the brief's requirements, lists what upstream does not document, and recommends build, continue or park.
+
+The orchestrator decides, not the model alone:
+
+Build when the review recommends it, the recomputed composite is at least 0.60 and the evidence score at least 0.4.
+
+Continue when the review asks for up to three specific questions that would settle the decision; they are opened and researched, then the project is reviewed again.
+
+Park otherwise, including a build recommendation the rubric does not support with no questions to resolve it. A project gets at most three reviews; the third decides build or park.
+
+Each review and outcome is recorded (reviews and decisions tables, author "applied-commons orchestrator, review v1"). Parking frees the project's slot.
+
+4c. Build packs
+
+A build decision is the compelling reason to invest substantial compute. The build pack documents everything needed to build one unit from public material, as four independent steps:
+
+Bill of materials: every part with specification, quantity, unit cost, currency, supplier link and locally available alternatives, and the cost basis.
+
+Design files: every git repository (pinned to a commit, with its licence) and design file (CAD, drawings, schematics, PCB, firmware, data) with a direct link and licence.
+
+Assembly: ordered steps with safety precautions, tools, skills and time.
+
+Test: acceptance criteria tied to the brief's requirements, safety checks and known failure modes.
+
+Each step also records the gaps upstream leaves. When all four steps have finished the project is complete and its slot frees up. Build packs document existing designs; they do not validate them (section 6). A completed build pack is not evidence that a build is safe or performs as claimed.
+
+Design files are kept as pinned local copies (ops/archive/archive_designs.py): a repository at its recorded commit and direct file downloads, only when the repository's licence file or the reported licence is a recognised open licence; anything else stays a link. The archiver fetches only https sources on public addresses.
+
+4d. Maintainer steering
+
+The maintainer may steer any project: build forces a build pack (admitting a candidate if needed, outside the slot limit), park parks it. A steer is recorded as a decision with author "maintainer (steer)" and acts once; clearing it does not undo what it caused.
+
 5. Focus and project limits
 
 The portfolio runs projects in parallel, limited by available compute (section 9):
@@ -244,3 +280,13 @@ Projects run in parallel, limited by Spark health and spare capacity (section 5)
 Research steps are short and are not preempted. PlantScope may wait for a running step to finish, for at most about ten minutes; Apollo enforces that limit on each step.
 
 Priority follows the Maslow layer, need severity and reach, effectiveness, ease of use and implementation, cost and practicality, weighted as in section 4a.
+
+2026-10-06:
+
+The product of Applied Commons research is a catalogue of open solutions to human needs, with full build packs (bill of materials, design files, assembly and test) for the compelling ones.
+
+The need is established first (need briefs, section 4a); the existing screening and admission stay as the first pass; a go/no-go review gates the build pack (section 4b), so substantial compute follows a compelling reason.
+
+The build gate is automatic, with maintainer override (section 4d).
+
+Design files are kept as pinned local copies when their licence allows (section 4c).
