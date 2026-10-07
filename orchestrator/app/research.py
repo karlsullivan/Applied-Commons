@@ -61,6 +61,20 @@ ENABLER_ATTENTION = 0.05
 ENABLER_DISCOVERY_PRIORITY = 0.65
 ENABLER_ASSESSMENT_PRIORITY = 0.75
 
+#: Climate groups a project works in year-round (policy section 2b), broad
+#: Koeppen groups. Cold-climate projects are a target in their own right
+#: (maintainer decision 2026-10-07), and the proving ground's seasons
+#: stand in for several groups.
+CLIMATES = ("tropical", "arid", "temperate", "cold", "polar")
+COLD_DISCOVERY_MIN = 2
+_CLIMATE_GUIDE = (
+    "Climates (where it works year-round, from evidence or sound "
+    "engineering reasoning): tropical (hot and humid all year), arid "
+    "(hot or cold deserts and drylands), temperate (mild winters), cold "
+    "(long freezing winters and low winter sun, e.g. Canada, Scandinavia, "
+    "Scotland, the northern US, Alaska), polar (tundra and ice)."
+)
+
 #: Rubric v1 weights (sum to 1). The evidence score is not weighted in;
 #: it scales the composite (see composite_score).
 WEIGHTS = {
@@ -138,6 +152,12 @@ class Assessment(BaseModel):
     questions: list[str] = Field(default_factory=list, max_length=5)
     #: Enablers only: the need categories it serves (by name).
     serves: list[str] = Field(default_factory=list, max_length=14)
+    climates: list[str] = Field(default_factory=list, max_length=5)
+
+    @field_validator("climates")
+    @classmethod
+    def _climates(cls, items):
+        return _check_climates(items)
 
     @field_validator("scores")
     @classmethod
@@ -179,6 +199,12 @@ def _check_scores(scores: dict[str, float]) -> dict[str, float]:
         if isinstance(value, bool) or not 0 <= value <= 1:
             raise ValueError("scores must be in 0..1")
     return scores
+
+
+def _check_climates(items: list[str]) -> list[str]:
+    """Known climate groups only, lower-cased, in CLIMATES order."""
+    given = {str(i).strip().lower() for i in items}
+    return [c for c in CLIMATES if c in given]
 
 
 def _check_texts(items: list[str], low: int, high: int) -> list[str]:
@@ -223,6 +249,12 @@ class Review(BaseModel):
     rationale: str = Field(min_length=20, max_length=4000)
     gaps: list[str] = Field(default_factory=list, max_length=10)
     questions: list[str] = Field(default_factory=list, max_length=3)
+    climates: list[str] = Field(default_factory=list, max_length=5)
+
+    @field_validator("climates")
+    @classmethod
+    def _climates(cls, items):
+        return _check_climates(items)
 
     @field_validator("scores")
     @classmethod
@@ -391,11 +423,18 @@ def need_brief_input(category: dict) -> dict[str, Any]:
             f"materials, climate, connectivity); and where existing solutions "
             f"fall short (gaps). The brief is used to judge candidate projects, "
             f"so make the requirements specific enough to test against. "
-            f"{_COMMON}"
+            f"{_COLD_BRIEF}{_COMMON}"
         ),
         "output_format": _BRIEF_FORMAT,
     }
 
+
+_COLD_BRIEF = (
+    "Cover cold-climate settings (long freezing winters and low winter "
+    "sun: Canada, Scandinavia, Scotland, the northern US, Alaska) "
+    "alongside low-income and tropical ones, and say where requirements "
+    "differ there (freezing, heating, low winter sun). "
+)
 
 _BRIEF_FORMAT = (
     '{"summary": "<one paragraph>", "brief": {"users": "<who and where, '
@@ -428,7 +467,7 @@ def _enabler_brief_input(category: dict) -> dict[str, Any]:
             f"day', 'under US$0.20 per kWh over its life'); practical "
             f"constraints; and where existing solutions fall short (gaps). "
             f"Frame every requirement by the essential need it serves. "
-            f"{_COMMON}"
+            f"{_COLD_BRIEF}{_COMMON}"
         ),
         "output_format": _BRIEF_FORMAT,
     }
@@ -454,7 +493,10 @@ def discovery_input(category: dict, known: list[str],
             f"with public designs or code) {what}"
             f"{category['name']} - {category['scope']} {against}Prefer mature, "
             f"documented, low-cost, locally buildable and maintainable work. "
-            f"Skip projects listed in already_known. {_COMMON}"
+            f"Where such projects exist, include at least {COLD_DISCOVERY_MIN} "
+            f"that work year-round in cold climates (long freezing winters, "
+            f"low winter sun: Canada, Scandinavia, Scotland, the northern US, "
+            f"Alaska). Skip projects listed in already_known. {_COMMON}"
         ),
         "output_format": (
             '{"summary": "<one paragraph>", "candidates": [{"name": "<project '
@@ -486,7 +528,7 @@ def assessment_input(project: dict) -> dict[str, Any]:
         '"requirements": {"need": "", "baseline": "", "improvement": "", '
         '"demonstration": "", "burden_removed": "", '
         '"practical_independence": ""}, "rationale": "<why these scores>", '
-        '"questions": ["<question>"]'
+        '"questions": ["<question>"], "climates": ["cold"]'
         + (', "serves": ["<need category>"]' if enabler else "")
         + '}, "evidence": [{"source_uri": "<url>", "title": "", '
         '"source_type": ""}]}'
@@ -515,7 +557,8 @@ def assessment_input(project: dict) -> dict[str, Any]:
             "requirement: need, baseline, improvement, demonstration, "
             "burden_removed, practical_independence; write 'unknown' where "
             "the evidence does not say. Propose up to 3 immediate engineering "
-            f"questions whose answers would most improve the project. {_COMMON}"
+            f"questions whose answers would most improve the project. List "
+            f"climates. {_CLIMATE_GUIDE} {_COMMON}"
         ),
         "output_format": output_format,
     }
@@ -589,6 +632,8 @@ def review_input(project: dict, review_number: int) -> dict[str, Any]:
             "would settle the decision"
             + (" (this is the last review: decide build or park)" if last else "")
             + ". List gaps: what the upstream project does not document. "
+            + "List climates, revising the assessment's with the evidence now "
+            + "available. " + _CLIMATE_GUIDE + " "
             + _COMMON
         ),
         "output_format": (
@@ -596,8 +641,9 @@ def review_input(project: dict, review_number: int) -> dict[str, Any]:
             '"build|continue|park", "scores": ' + _SCORES_FORMAT + ', "fit": '
             '"<requirement by requirement>", "rationale": "<why this '
             'decision>", "gaps": ["<undocumented item>"], "questions": '
-            '["<question, only for continue>"]}, "evidence": [{"source_uri": '
-            '"<url>", "title": "", "source_type": ""}]}'
+            '["<question, only for continue>"], "climates": ["cold"]}, '
+            '"evidence": [{"source_uri": "<url>", "title": "", '
+            '"source_type": ""}]}'
         ),
     }
 

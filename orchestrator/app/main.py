@@ -859,7 +859,7 @@ def catalogue():
                 SELECT p.id, p.code, p.name, p.status, {_STAGE_SQL} AS stage,
                        p.maslow_level AS layer, c.name AS category, p.score,
                        p.summary, p.source_uris, p.steer, p.steer_note,
-                       COALESCE(c.track, 'need') AS track, p.serves,
+                       COALESCE(c.track, 'need') AS track, p.serves, p.climates,
                        (SELECT d.decision FROM decisions d WHERE d.project_id = p.id
                         ORDER BY d.id DESC LIMIT 1) AS decision,
                        (SELECT count(*) FROM questions q WHERE q.project_id = p.id
@@ -916,7 +916,7 @@ def project_record(project_id: int):
                 SELECT p.id, p.code, p.name, p.status, {_STAGE_SQL} AS stage,
                        p.maslow_level AS layer, c.name AS category, p.category_id,
                        p.score, p.summary, p.source_uris, p.steer, p.steer_note,
-                       COALESCE(c.track, 'need') AS track, p.serves,
+                       COALESCE(c.track, 'need') AS track, p.serves, p.climates,
                        p.created_at
                 FROM projects p LEFT JOIN need_categories c ON c.id = p.category_id
                 WHERE p.id = %s
@@ -1495,7 +1495,8 @@ def _store_assessment(cur, job, assessment) -> dict:
         (project_id, job["id"], research.RUBRIC_VERSION, Jsonb(assessment.scores),
          composite, Jsonb(assessment.requirements), assessment.rationale),
     )
-    cur.execute("UPDATE projects SET score = %s WHERE id = %s", (composite, project_id))
+    cur.execute("UPDATE projects SET score = %s, climates = %s WHERE id = %s",
+                (composite, Jsonb(assessment.climates), project_id))
     for text in assessment.questions:
         cur.execute(
             "INSERT INTO questions (project_id, question, priority) VALUES (%s, %s, %s)",
@@ -1523,6 +1524,9 @@ def _store_review(cur, job, review) -> dict:
          Jsonb(review.scores), composite, review.fit, review.rationale,
          Jsonb(review.gaps)),
     )
+    if review.climates:  # the review's view supersedes the screening's
+        cur.execute("UPDATE projects SET climates = %s WHERE id = %s",
+                    (Jsonb(review.climates), project_id))
     if project["status"] != "active":
         return {"outcome": outcome, "composite": composite, "acted": False}
     cur.execute("UPDATE projects SET score = %s WHERE id = %s", (composite, project_id))

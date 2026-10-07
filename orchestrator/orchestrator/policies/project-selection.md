@@ -39,6 +39,12 @@ An enabler project is screened on the needs it serves: its assessment lists the 
 
 Enablers compete for the same slots under the same rubric and thresholds, with a slight attention bump: their pipeline steps queue a little ahead, and admission orders them as if their composite were 0.05 higher. The recorded composite is not changed.
 
+2b. Climates
+
+Needs and solutions differ by climate. Each screening and review records the climate groups a project works in year-round (tropical, arid, temperate, cold, polar), from evidence or sound engineering reasoning. Cold climates (long freezing winters and low winter sun: Canada, Scandinavia, Scotland, the northern US, Alaska) are a target in their own right: need briefs cover cold-climate settings and say where requirements differ there, and each discovery includes at least two candidates that work year-round in cold climates, where such projects exist. Climate does not change the rubric; it records where a result applies.
+
+The maintainer's land in Estonia is a proving ground for physical trials. Its seasons stand in for several climate groups (summer for temperate conditions, winter for cold ones), so trials are chosen by the season that matches the target climate, not limited to the local climate. Results apply to the conditions tested (SAFETY.md).
+
 3. Admission requirements
 
 Every candidate must address the following six requirements. Distinguish established facts, estimates, assumptions and unknowns. Early feasibility work may investigate missing evidence; development admission requires a sufficiently credible case and a defined route to testing it.
@@ -304,3 +310,5 @@ Design files are kept as pinned local copies when their licence allows (section 
 Software and data projects stay in the catalogue. Their build pack documents a working deployment: the hardware, hosting and services needed with their costs; source repositories, data and configuration; installation and deployment; and verification of a running instance.
 
 Enablers are a track alongside the layers (section 2a), starting with Energy, Communications and information, and Environment and climate, then Fabrication and tools, Transport and logistics, Instrumentation and control, Skills and know-how (including maintenance and repair), Computing and open data, Cold chain and storage, Mapping and geospatial, Finance and payments, and Materials and circularity; more may be added. Environmental enablers and the environmental Safety need both stay. Enablers compete equally for slots, with a slight attention bump.
+
+Applied Commons progresses beyond research to physical trials. The maintainer's 3 ha in Estonia is the proving ground, used as appropriate for each candidate; it does not limit work to the Estonian climate. Cold-climate, year-round solutions are a target alongside the others (section 2b).

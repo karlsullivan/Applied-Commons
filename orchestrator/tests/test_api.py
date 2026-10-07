@@ -825,3 +825,42 @@ def test_the_briefly_deployed_sensing_category_is_removed(client):
     assert sql("SELECT count(*) FROM need_categories "
                "WHERE name = 'Sensing and monitoring'") == [(0,)]
     assert sql("SELECT count(*) FROM jobs WHERE job_type = 'need-brief'") == [(FOCUS_CATEGORIES,)]
+
+
+# ---------------------------------------------------------------------------
+# Climates (policy section 2b)
+# ---------------------------------------------------------------------------
+
+
+def test_cold_climates_are_asked_for_and_recorded(client):
+    discover(client)
+    [(brief,)] = sql("SELECT input FROM jobs WHERE job_type = 'need-brief' ORDER BY id LIMIT 1")
+    assert "Scandinavia" in brief["instructions"]
+    sql("DELETE FROM jobs")
+    pid = admitted_project(client)
+    [(discovery,)] = sql("SELECT input FROM jobs WHERE job_type = 'candidate-discovery' "
+                         "ORDER BY id LIMIT 1")
+    assert "at least 2 that work year-round in cold climates" in discovery["instructions"]
+    # The screening's climates: unknown groups dropped, CLIMATES order.
+    assert sql("SELECT climates FROM projects") == [([],)]
+    run_job(client, "literature-collection", FINDINGS)
+    discover(client)
+    output = review_output("build")
+    output["review"]["climates"] = ["Cold", "temperate", "lunar"]
+    run_job(client, "project-review", output)
+    assert client.get("/catalogue").json()["projects"][0]["climates"] == ["temperate", "cold"]
+    assert client.get(f"/projects/{pid}/record").json()["project"]["climates"] == [
+        "temperate", "cold"]
+
+
+def test_screening_records_climates(client):
+    seed_briefs()
+    discover(client, limit=1)
+    run_job(client, "candidate-discovery", candidates("Slow Sand Filter"))
+    discover(client)
+    job = claim(client, APOLLO, ["candidate-assessment"]).json()["job"]
+    assert "Alaska" in job["input"]["instructions"] and '"climates"' in job["input"]["output_format"]
+    output = strong_assessment()
+    output["assessment"]["climates"] = ["polar", "tropical"]
+    complete(client, job, output)
+    assert sql("SELECT climates FROM projects") == [(["tropical", "polar"],)]
