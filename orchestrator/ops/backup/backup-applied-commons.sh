@@ -11,9 +11,9 @@
 # Design archives ($AC_EXPORTS) are not copied locally (they are pinned
 # copies of public sources); they go off-site with the dumps.
 #
-# Off-site: when AC_BACKUP_OFFSITE is set (in /etc/applied-commons/
-# backup.env, e.g. user@host:/path for rsync over ssh), the dumps, site
-# profiles and design archives are copied there after each backup.
+# Off-site: when AC_SP_* are set (in /etc/applied-commons/backup.env), the
+# dumps, site profiles and design archives are copied, encrypted, to one
+# SharePoint folder (offsite_sharepoint.py, which documents the setup).
 #
 # On failure, one push message (the ntfy topic in /etc/apollo/alerts.env)
 # and a non-zero exit, so the unit shows as failed.
@@ -27,7 +27,6 @@ DATA="${AC_DATA:-/srv/orchestrator/tenants/applied-commons/data}"
 EXPORTS="${AC_EXPORTS:-/srv/orchestrator/tenants/applied-commons/exports}"
 DIR="${AC_BACKUP_DIR:-/var/backups/applied-commons}"
 DAYS="${AC_BACKUP_DAYS:-14}"
-OFFSITE="${AC_BACKUP_OFFSITE:-}"
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 
 alert() {
@@ -62,10 +61,9 @@ find "$DIR" -maxdepth 1 -type f \( -name 'applied_commons_*.dump' -o -name 'site
     -mtime +"$DAYS" -delete
 find "$DIR" -maxdepth 1 -type f -name '.*.tmp' -mmin +120 -delete
 
-if [ -n "$OFFSITE" ]; then
-    rsync -a --delete-after "$DIR/" "$OFFSITE/backups/"
-    [ ! -d "$EXPORTS" ] || rsync -a "$EXPORTS/" "$OFFSITE/exports/"
-    echo "off-site: copied to $OFFSITE"
+if [ -n "${AC_SP_FOLDER_ID:-}" ]; then
+    AC_BACKUP_DIR="$DIR" AC_EXPORTS="$EXPORTS" \
+        python3 "$(dirname "$0")/offsite_sharepoint.py" sync
 else
-    echo "off-site: not configured (AC_BACKUP_OFFSITE)"
+    echo "off-site: not configured (AC_SP_* in /etc/applied-commons/backup.env)"
 fi
