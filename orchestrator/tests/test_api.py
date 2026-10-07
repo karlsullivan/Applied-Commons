@@ -1231,3 +1231,54 @@ def test_categories_list_every_category_with_its_brief(client):
     tracks = [c["track"] for c in cats]
     assert tracks == sorted(tracks, key=lambda t: t == "enabler")  # needs first
     assert all(c["focus"] for c in cats if c["track"] == "enabler")
+
+
+def test_source_checks_are_due_recorded_and_shown(client):
+    from psycopg.types.json import Jsonb
+
+    screened(2)
+    [(pid,)] = sql("SELECT id FROM projects WHERE code = 'p-water-0'")
+    sql("UPDATE projects SET source_uris = %s WHERE id = %s",
+        Jsonb(["https://github.com/o/r", "https://x.org"]), pid)
+    sql("INSERT INTO build_packs (project_id, section, content) VALUES (%s, 'design', %s)",
+        pid, Jsonb({"repositories": [{"url": "https://gitlab.com/g/r", "licence": "MIT"}]}))
+    due = client.get("/checks/pending").json()
+    assert len(due) == 2
+    first = next(d for d in due if d["id"] == pid)
+    assert first["urls"] == ["https://github.com/o/r", "https://x.org", "https://gitlab.com/g/r"]
+    assert first["reported"] == [{"url": "https://gitlab.com/g/r", "licence": "MIT"}]
+
+    r = client.post(f"/projects/{pid}/check", json={
+        "links": [{"url": "https://x.org", "state": "broken", "status": 404}],
+        "licence": "CERN-OHL-S-2.0", "licence_class": "share-alike",
+        "licence_source": "GitHub (verified)", "repository": "https://github.com/o/r",
+        "last_activity": "2026-05-01T00:00:00Z", "archived": False})
+    assert r.status_code == 200, r.text
+    assert pid not in [d["id"] for d in client.get("/checks/pending").json()]
+
+    row = next(p for p in client.get("/catalogue").json()["projects"] if p["id"] == pid)
+    assert (row["licence"], row["licence_class"], row["broken_links"]) == (
+        "CERN-OHL-S-2.0", "share-alike", 1)
+    other = next(p for p in client.get("/catalogue").json()["projects"] if p["id"] != pid)
+    assert other["licence_class"] == "unchecked"
+    record = client.get(f"/projects/{pid}/record").json()
+    assert record["check"]["licence_source"] == "GitHub (verified)"
+    # Module synthesis sees the class.
+    import main
+    with main.db() as conn, conn.cursor() as cur:
+        digest = {d["name"]: d for d in main._projects_digest(cur)}
+    assert digest["P Water 0"]["licence_class"] == "share-alike"
+    # Due again after the period.
+    sql("UPDATE source_checks SET checked_at = NOW() - INTERVAL '15 days'")
+    assert pid in [d["id"] for d in client.get("/checks/pending").json()]
+
+
+@pytest.mark.parametrize("body", [
+    {"licence_class": "maybe"},
+    {"licence_class": "open", "links": [{"url": "https://x.org", "state": "fine"}]},
+])
+def test_invalid_checks_are_refused(client, body):
+    pid = project(client, code="CHK-1")
+    assert client.post(f"/projects/{pid}/check", json=body).status_code == 422
+    assert client.post("/projects/999999/check",
+                       json={"licence_class": "open"}).status_code == 404

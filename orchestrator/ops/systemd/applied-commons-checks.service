@@ -1,0 +1,9 @@
+[Unit]
+Description=Applied Commons source checks (links, licences, activity of catalogue projects)
+
+[Service]
+Type=oneshot
+Environment=AC_API_URL=http://127.0.0.1:8100
+ExecStart=/usr/bin/python3 /srv/orchestrator/tenants/applied-commons/workspaces/Applied-Commons/orchestrator/ops/checks/check_sources.py
+TimeoutStartSec=1h
+Nice=10

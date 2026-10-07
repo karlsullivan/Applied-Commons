@@ -215,6 +215,10 @@ Proving-ground profiles are kept on the host, not in this repository, and reach 
 
 A project-relations job relates catalogue projects to each other, so that a reader finds what a project depends on or competes with: uses (a house design cut on a CNC router uses the router), enables, alternative, and part-of. It runs monthly and each time another 25 projects have been assessed, over the most promising 200 assessed projects, and adds to the relations found before. Relations link projects in the published wiki; they are not evidence about either project.
 
+4g. Source checks
+
+Every project's sources are checked automatically, without a model (ops/checks/check_sources.py), when first catalogued and every 14 days after: whether its links answer (ok, broken, blocked by the site, unreachable), its licence, and whether its repository is maintained or archived. The licence comes from the GitHub or GitLab API where the project has a repository there (verified); otherwise from what its build pack reported (unverified). Each project is classed open, share-alike, restricted (non-commercial or no-derivatives), none (a repository without a licence, so all rights reserved) or unknown (an unrecognised licence or nothing to check). Modules build only on open and share-alike projects (section 9); a project classed none or unknown may still be catalogued and researched, and its authors can be asked to add a licence.
+
 5. Focus and project limits
 
 The portfolio runs projects in parallel, limited by available compute (section 9):

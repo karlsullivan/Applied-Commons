@@ -1,5 +1,6 @@
 import os
 import time
+from datetime import datetime
 from typing import Any
 
 import modular
@@ -162,6 +163,25 @@ class ArchiveRecord(BaseModel):
     bytes: int | None = Field(default=None, ge=0)
     sha256: str | None = Field(default=None, pattern="^[0-9a-f]{64}$")
     note: str = Field(default="", max_length=2000)
+
+
+class LinkCheck(BaseModel):
+    url: str = Field(max_length=2000)
+    state: str = Field(pattern="^(ok|broken|blocked|unreachable|skipped)$")
+    status: int | None = None
+    final_url: str | None = Field(default=None, max_length=2000)
+    note: str = Field(default="", max_length=300)
+
+
+class SourceCheck(BaseModel):
+    """One check of a project's sources (ops/checks/check_sources.py)."""
+    links: list[LinkCheck] = Field(default_factory=list, max_length=40)
+    licence: str | None = Field(default=None, max_length=200)
+    licence_class: str = Field(pattern="^(open|share-alike|restricted|none|unknown)$")
+    licence_source: str | None = Field(default=None, max_length=200)
+    repository: str | None = Field(default=None, max_length=2000)
+    last_activity: datetime | None = None
+    archived: bool | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -980,9 +1000,13 @@ def _projects_digest(cur, category_id=None, limit=120, detail=False) -> list[dic
     cur.execute(
         """
         SELECT DISTINCT ON (p.id) p.id, p.name, p.status, p.summary, p.climates,
-               p.serves, p.score, c.name AS category, c.track, a.rationale
+               p.serves, p.score, c.name AS category, c.track, a.rationale,
+               sc.licence, COALESCE(sc.licence_class, 'unchecked') AS licence_class
         FROM projects p JOIN assessments a ON a.project_id = p.id
         LEFT JOIN need_categories c ON c.id = p.category_id
+        LEFT JOIN LATERAL (SELECT licence, licence_class FROM source_checks
+                           WHERE project_id = p.id
+                           ORDER BY checked_at DESC, id DESC LIMIT 1) sc ON TRUE
         WHERE (%s::bigint IS NULL OR p.category_id = %s::bigint)
         ORDER BY p.id, a.created_at DESC
         """,
@@ -993,7 +1017,8 @@ def _projects_digest(cur, category_id=None, limit=120, detail=False) -> list[dic
     for r in rows:
         item = {"name": r["name"], "category": r["category"], "status": r["status"],
                 "summary": _clip(r["summary"], 600 if detail else 300),
-                "climates": r["climates"]}
+                "climates": r["climates"], "licence": r["licence"],
+                "licence_class": r["licence_class"]}
         if r["track"] == research.ENABLER:
             item["serves"] = r["serves"]
         if detail:
@@ -1321,8 +1346,15 @@ def catalogue():
                            (SELECT max(created_at) FROM build_packs WHERE project_id = p.id),
                            (SELECT max(created_at) FROM design_archives WHERE project_id = p.id),
                            (SELECT max(created_at) FROM questions WHERE project_id = p.id)
-                       ) AS updated_at
+                       ) AS updated_at,
+                       sc.licence, COALESCE(sc.licence_class, 'unchecked') AS licence_class,
+                       sc.last_activity, sc.archived AS repository_archived,
+                       sc.checked_at AS sources_checked_at,
+                       (SELECT count(*) FROM jsonb_array_elements(sc.links) l
+                        WHERE l->>'state' IN ('broken', 'unreachable')) AS broken_links
                 FROM projects p LEFT JOIN need_categories c ON c.id = p.category_id
+                LEFT JOIN LATERAL (SELECT * FROM source_checks WHERE project_id = p.id
+                                   ORDER BY checked_at DESC, id DESC LIMIT 1) sc ON TRUE
                 ORDER BY p.maslow_level, c.name, p.score DESC NULLS LAST, p.id
                 """
             )
@@ -1411,6 +1443,10 @@ def project_record(project_id: int):
                     "SELECT source_uri, kind, revision, resolved_revision, licence, "
                     "status, path, bytes, sha256, note, created_at "
                     "FROM design_archives WHERE project_id = %s ORDER BY id"),
+                "check": next(iter(rows(
+                    "SELECT links, licence, licence_class, licence_source, repository, "
+                    "last_activity, archived, checked_at FROM source_checks "
+                    "WHERE project_id = %s ORDER BY checked_at DESC, id DESC LIMIT 1")), None),
             }
 
 
@@ -1581,6 +1617,72 @@ def record_archive(item: ArchiveRecord):
                 (item.project_id, item.source_uri, item.kind, item.revision,
                  item.resolved_revision, item.licence, item.status, item.path,
                  item.bytes, item.sha256, item.note),
+            )
+            result = cur.fetchone()
+        conn.commit()
+    return result
+
+
+#: A project's sources are checked again after this many days.
+CHECK_EVERY_DAYS = 14
+
+
+@app.get("/checks/pending")
+def checks_pending(limit: int = 20):
+    """Projects whose sources are due a check (never checked, or not for
+    CHECK_EVERY_DAYS), most advanced first, with the URLs to check and the
+    licences reported for them (build pack design section, archives)."""
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT p.id, p.code, p.name, p.source_uris
+                FROM projects p
+                LEFT JOIN LATERAL (SELECT max(checked_at) AS at FROM source_checks
+                                   WHERE project_id = p.id) c ON TRUE
+                WHERE c.at IS NULL OR c.at < NOW() - make_interval(days => %s)
+                ORDER BY c.at NULLS FIRST, p.status = 'active' DESC,
+                         p.score DESC NULLS LAST, p.id
+                LIMIT %s
+                """,
+                (CHECK_EVERY_DAYS, max(1, min(limit, 100))),
+            )
+            projects = cur.fetchall()
+            for p in projects:
+                cur.execute(
+                    "SELECT content FROM build_packs WHERE project_id = %s AND section = 'design' "
+                    "ORDER BY created_at DESC, id DESC LIMIT 1", (p["id"],))
+                design = (cur.fetchone() or {}).get("content") or {}
+                p["reported"] = [{"url": r.get("url"), "licence": r.get("licence")}
+                                 for r in design.get("repositories") or [] if r.get("url")]
+                cur.execute(
+                    "SELECT source_uri AS url, licence FROM design_archives "
+                    "WHERE project_id = %s AND licence IS NOT NULL AND licence <> 'unknown'",
+                    (p["id"],))
+                p["reported"] += cur.fetchall()
+                p["urls"] = list(dict.fromkeys(
+                    [u for u in p.pop("source_uris") or [] if isinstance(u, str)]
+                    + [r["url"] for r in p["reported"]]))[:20]
+    return projects
+
+
+@app.post("/projects/{project_id}/check")
+def record_check(project_id: int, item: SourceCheck):
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1 FROM projects WHERE id = %s", (project_id,))
+            if cur.fetchone() is None:
+                raise HTTPException(status_code=404, detail="no such project")
+            cur.execute(
+                """
+                INSERT INTO source_checks (project_id, links, licence, licence_class,
+                    licence_source, repository, last_activity, archived)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                RETURNING id, licence_class, checked_at
+                """,
+                (project_id, Jsonb([link.model_dump() for link in item.links]), item.licence,
+                 item.licence_class, item.licence_source, item.repository,
+                 item.last_activity, item.archived),
             )
             result = cur.fetchone()
         conn.commit()
