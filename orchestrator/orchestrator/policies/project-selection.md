@@ -201,6 +201,8 @@ Applied Commons works in four overlapping stages: (1) understand the needs and w
 
 Interface standards: the shared electrical, fluid, mechanical, data, thermal and software interfaces modules connect through. A standards-synthesis job proposes them monthly from everything stage 1 has found, preferring existing, cheap, worldwide standards. The maintainer approves or rejects each one; a decided standard is not changed by later proposals.
 
+Verification: before the maintainer decides, each proposed standard is checked against the established standards for its interface (ISO, IEC, EN and national adoptions such as DIN, AS/NZS, and others such as UL where relevant) by a standard-verification job, again whenever its specification changes. It cites the relevant standards, lists every deviation with its risk and any justification, says whether the interface is safety-critical, gives the controls a deviation needs, and recommends approve, revise or reject. A standard is approved only once its current specification has been verified; rejecting needs no verification. The aim is to build nothing unsafe without adding needless overhead: adopting an existing standard outright is preferred, and a verification works from catalogue pages and reputable summaries where full texts are paywalled, saying what it could not check.
+
 Modules: reusable, self-contained hardware or software building blocks. Once at least one standard is approved, a module-synthesis job per need or enabler domain (with at least two screened projects) runs monthly, reusing and extending existing modules rather than duplicating them. Modules connect only through approved standards; a module needing an uncovered interface proposes a standard and waits for it. Each module is costed at EU prices and at low-income-country prices with the cheapest locally available substitutes. A model may describe a module as a concept or documented; built and tested are set only by trials.
 
 Systems: compositions of modules for five scenarios: a single-family household; a homestead (the same family on a larger plot); a small farm; a community facility such as a clinic or school; and a village. A system-design job per scenario runs monthly after that month's module syntheses have finished. It does the engineering: calculations such as energy, water, thermal and load budgets, kept as code with inputs and results and labelled calculated or simulated; interface checks; costs; failure modes; and the modules still missing.
@@ -208,6 +210,10 @@ Systems: compositions of modules for five scenarios: a single-family household; 
 Roadmap: a roadmap-revision job runs monthly after that month's system designs have finished. It orders standards, modules, systems and trials by dependency and leverage, cheapest and most transferable first, and places each trial at the proving ground in the season matching its target climates (section 2b). The maintainer approves each version; one roadmap is approved at a time. Trials (stage 3) are proposed from approved roadmap steps.
 
 Proving-ground profiles are kept on the host, not in this repository, and reach only roadmap revisions.
+
+4f. Project relations
+
+A project-relations job relates catalogue projects to each other, so that a reader finds what a project depends on or competes with: uses (a house design cut on a CNC router uses the router), enables, alternative, and part-of. It runs monthly and each time another 25 projects have been assessed, over the most promising 200 assessed projects, and adds to the relations found before. Relations link projects in the published wiki; they are not evidence about either project.
 
 5. Focus and project limits
 
@@ -328,3 +334,7 @@ Enablers are a track alongside the layers (section 2a), starting with Energy, Co
 Applied Commons progresses beyond research to physical trials. The maintainer's 3 ha in Estonia is the proving ground, used as appropriate for each candidate; it does not limit work to the Estonian climate. Cold-climate, year-round solutions are a target alongside the others (section 2b).
 
 Before trials, a modular set (section 4e): interface standards approved by the maintainer, modules built on them, systems for five scenarios (single-family household, homestead, small farm, community facility, village) and a roadmap revised monthly and approved by the maintainer. The cheaper the better, so results stay usable in low-income countries.
+
+Proposed standards are verified against established standards (ISO, IEC, EN/DIN, AS/NZS) before approval, with deviations called out (section 4e): nothing unsafe, without heavy overhead.
+
+The published catalogue is navigable by layer, category and project, with related projects linked across categories (section 4f).

@@ -1158,3 +1158,76 @@ def test_listed_deviations_make_an_aligned_verification_deviate():
 
     v = modular.Verification(**{**VERIFIED["verification"], "outcome": "aligned"})
     assert v.outcome == "deviates"
+
+
+def test_relations_run_monthly_and_as_the_catalogue_grows(client):
+    import modular
+
+    screened(9)
+    assert discover(client)["relations"] == []
+    screened(1, prefix="Q")
+    [job] = discover(client)["relations"]
+    assert job["unit_key"] == f"project-relations:{modular.month()}:0"
+    assert discover(client)["relations"] == []
+    [(payload,)] = sql("SELECT input FROM jobs WHERE job_type = 'project-relations'")
+    assert len(payload["projects"]) == 10
+    assert {"code", "name", "category", "summary"} <= set(payload["projects"][0])
+    screened(15, prefix="R")  # 25 assessed: the next step
+    [job] = discover(client)["relations"]
+    assert job["unit_key"].endswith(":1")
+
+
+def test_relations_are_stored_between_known_projects(client):
+    screened(10)
+    discover(client)
+    out = {"summary": "s", "relations": [
+        {"a": "p-water-1", "b": "p-water-0", "kind": "Uses", "why": "Cut on the router."},
+        {"a": "p-water-3", "b": "p-water-2", "kind": "alternative", "why": "Same need."},
+        {"a": "p-water-2", "b": "nope", "kind": "enables", "why": "Unknown project."},
+        {"a": "p-water-4", "b": "p-water-4", "kind": "part-of", "why": "Itself."},
+    ]}
+    job, r = run_job(client, "project-relations", out)
+    assert r.status_code == 200, r.text
+    assert r.json()["relations"] == 2 and r.json()["skipped"] == 2
+    rels = client.get("/relations").json()
+    assert [(x["a_code"], x["b_code"], x["kind"]) for x in rels] == [
+        ("p-water-1", "p-water-0", "uses"), ("p-water-2", "p-water-3", "alternative")]
+    assert rels[0]["a_name"] == "P Water 1"
+    # Found again: one row, the newer reason; the next job lists it as known.
+    sql("UPDATE jobs SET unit_key = 'old' WHERE id = %s", job["id"])
+    discover(client)
+    [(payload,)] = sql("SELECT input FROM jobs WHERE job_type = 'project-relations' "
+                       "AND status = 'queued'")
+    assert {"a": "p-water-1", "b": "p-water-0", "kind": "uses"} in payload["existing_relations"]
+    _, r = run_job(client, "project-relations", {"summary": "s", "relations": [
+        {"a": "p-water-1", "b": "p-water-0", "kind": "uses", "why": "A newer reason."}]})
+    rels = client.get("/relations").json()
+    assert len(rels) == 2 and rels[0]["why"] == "A newer reason."
+
+
+@pytest.mark.parametrize("relation", [
+    {"a": "x", "b": "y", "kind": "loves", "why": "Not a kind."},
+    {"a": "x", "b": "y", "kind": "uses", "why": ""},
+])
+def test_invalid_relations_write_nothing(client, relation):
+    screened(10)
+    discover(client)
+    job, r = run_job(client, "project-relations", {"summary": "s", "relations": [relation]})
+    assert r.status_code == 422
+    assert sql("SELECT status FROM jobs WHERE id = %s", job["id"]) == [("running",)]
+
+
+def test_categories_list_every_category_with_its_brief(client):
+    from psycopg.types.json import Jsonb
+
+    [(cid,)] = sql("SELECT id FROM need_categories WHERE name = 'Water'")
+    sql("INSERT INTO need_briefs (category_id, brief) VALUES (%s, %s)", cid, Jsonb(BRIEF))
+    cats = client.get("/categories").json()
+    assert len(cats) == sql("SELECT count(*) FROM need_categories")[0][0]
+    water = next(c for c in cats if c["name"] == "Water")
+    assert water["focus"] and water["brief"]["users"] == BRIEF["users"]
+    assert all(c["brief"] is None for c in cats if c["name"] != "Water")
+    assert {c["focus"] for c in cats if c["layer"] and c["layer"] > 2} == {False}
+    tracks = [c["track"] for c in cats]
+    assert tracks == sorted(tracks, key=lambda t: t == "enabler")  # needs first
+    assert all(c["focus"] for c in cats if c["track"] == "enabler")

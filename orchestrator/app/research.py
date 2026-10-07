@@ -29,6 +29,16 @@ ASSESSMENT = "candidate-assessment"
 LITERATURE = "literature-collection"
 REVIEW = "project-review"
 BUILD_PACK = "build-pack"
+RELATIONS = "project-relations"
+
+#: Relations between catalogue projects (policy section 4f): a new
+#: project-relations job each month and each time RELATIONS_STEP more
+#: projects have been assessed, once RELATIONS_MIN_ASSESSED have been.
+RELATION_KINDS = ("uses", "enables", "alternative", "part-of")
+RELATIONS_MIN_ASSESSED = 10
+RELATIONS_STEP = 25
+RELATIONS_PRIORITY = 0.7
+RELATIONS_MAX_PROJECTS = 200
 
 #: A category's need brief is refreshed after this many days.
 BRIEF_REFRESH_DAYS = 90
@@ -774,3 +784,63 @@ def admission_case_made(requirements: dict[str, str]) -> bool:
         and requirements[key].strip().lower() != "unknown"
         for key in ADMISSION_REQUIRED
     )
+
+
+# ---------------------------------------------------------------------------
+# Project relations (policy section 4f)
+# ---------------------------------------------------------------------------
+
+
+class Relation(BaseModel):
+    a: str = Field(min_length=1, max_length=120)
+    b: str = Field(min_length=1, max_length=120)
+    kind: str
+    why: str = Field(min_length=5, max_length=500)
+
+    @field_validator("a", "b")
+    @classmethod
+    def _code(cls, value):
+        return value.strip()
+
+    @field_validator("kind")
+    @classmethod
+    def _kind(cls, value):
+        value = str(value).strip().lower().replace("_", "-").replace(" ", "-")
+        if value not in RELATION_KINDS:
+            raise ValueError(f"relation kind must be one of {', '.join(RELATION_KINDS)}")
+        return value
+
+
+class RelationsResult(BaseModel):
+    relations: list[Relation] = Field(max_length=200)
+
+
+def relations_input(projects: list[dict], existing: list[dict]) -> dict[str, Any]:
+    return {
+        "projects": projects,
+        "existing_relations": existing,
+        "instructions": (
+            "Applied Commons catalogues open hardware and software projects "
+            "that meet human needs (housing, water, food, health and more) and "
+            "the enablers they depend on (energy, fabrication, communications "
+            "and more). Relate the projects below to each other, so that a "
+            "reader of one project finds the others it depends on or competes "
+            "with. Kinds: uses (a needs, or is built with, b: a house design "
+            "cut on a CNC router uses that router); enables (a makes b possible "
+            "or cheaper without being part of it: a solar charge controller "
+            "enables an off-grid fridge); alternative (a and b meet the same "
+            "need in different ways); part-of (a is a component or subsystem "
+            "of b). Relate projects across categories as well as within them; "
+            "cross-category links (an enabler and the needs it serves) are the "
+            "most useful. Refer to projects only by the codes given; say why "
+            "in one sentence. Do not repeat existing_relations. Prefer up to "
+            "100 strong relations over many weak ones. Work from the catalogue; "
+            "check a project's page only when unsure. Never invent projects or "
+            "relations."
+        ),
+        "output_format": (
+            '{"summary": "<one paragraph>", "relations": [{"a": "<project code>", '
+            '"b": "<project code>", "kind": "uses|enables|alternative|part-of", '
+            '"why": ""}], "evidence": []}'
+        ),
+    }

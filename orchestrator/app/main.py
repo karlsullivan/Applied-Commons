@@ -28,6 +28,7 @@ DEFAULT_JOB_TYPE_OWNERS = {
     "module-synthesis": "apollo-hermes",
     "system-design": "apollo-hermes",
     "roadmap-revision": "apollo-hermes",
+    "project-relations": "apollo-hermes",
     "candidate-assessment": "apollo-hermes",
     "literature-collection": "apollo-hermes",
     "source-summarisation": "apollo-hermes",
@@ -798,7 +799,9 @@ def discover_backlog(item: BacklogDiscover):
     8. modular set (stage 2, section 4e): monthly standards synthesis;
        module synthesis per domain once standards are approved; system
        design per scenario after the month's modules; the roadmap after the
-       month's systems.
+       month's systems;
+    9. relations: a project-relations job over the catalogue each month
+       and each time enough new projects have been assessed (section 4f).
 
     Every job carries a stable unit key, so repeated runs never enqueue the
     same unit twice; completed or failed units are not re-enqueued. Topics
@@ -816,6 +819,7 @@ def discover_backlog(item: BacklogDiscover):
             builds = _build_packs(cur, item.limit)
             completed = _complete_builds(cur)
             modular_set = _modular_set(cur, item.limit)
+            relations = _relate_projects(cur)
         conn.commit()
     return {
         "steered": steered,
@@ -828,7 +832,115 @@ def discover_backlog(item: BacklogDiscover):
         "builds": builds,
         "completed": completed,
         "modular": modular_set,
+        "relations": relations,
     }
+
+
+# ---------------------------------------------------------------------------
+# Project relations (policy section 4f)
+# ---------------------------------------------------------------------------
+
+
+def _relate_projects(cur, month: str | None = None) -> list:
+    """A project-relations job each month, and again each time another
+    RELATIONS_STEP projects have been assessed."""
+    cur.execute("SELECT count(DISTINCT project_id) AS n FROM assessments")
+    assessed = cur.fetchone()["n"]
+    if assessed < research.RELATIONS_MIN_ASSESSED:
+        return []
+    key = (f"{research.RELATIONS}:{month or modular.month()}:"
+           f"{assessed // research.RELATIONS_STEP}")
+    if _unit_exists(cur, key):
+        return []
+    cur.execute(
+        """
+        SELECT DISTINCT ON (p.id) p.id, p.code, p.name, p.summary, p.serves, p.score,
+               c.name AS category, COALESCE(c.track, 'need') AS track
+        FROM projects p JOIN assessments a ON a.project_id = p.id
+        LEFT JOIN need_categories c ON c.id = p.category_id
+        ORDER BY p.id
+        """
+    )
+    rows = sorted(cur.fetchall(), key=lambda r: -(r["score"] or 0))
+    projects = [{"code": r["code"], "name": r["name"], "category": r["category"],
+                 "track": r["track"], "summary": _clip(r["summary"], 240),
+                 **({"serves": r["serves"]} if r["track"] == research.ENABLER else {})}
+                for r in rows[:research.RELATIONS_MAX_PROJECTS]]
+    cur.execute("SELECT pa.code AS a, pb.code AS b, r.kind FROM project_relations r "
+                "JOIN projects pa ON pa.id = r.a JOIN projects pb ON pb.id = r.b "
+                "ORDER BY r.id")
+    existing = cur.fetchall()
+    job = _enqueue(cur, unit_key=key, job_type=research.RELATIONS,
+                   priority=research.RELATIONS_PRIORITY,
+                   payload=research.relations_input(projects, existing))
+    return [job] if job else []
+
+
+def _store_relations(cur, job, result) -> dict:
+    """Relations between known projects; an alternative is stored once
+    (a < b). A relation found again gets the newer reason."""
+    cur.execute("SELECT id, code FROM projects")
+    ids = {r["code"]: r["id"] for r in cur.fetchall()}
+    stored = skipped = 0
+    for rel in result.relations:
+        a, b = ids.get(rel.a), ids.get(rel.b)
+        if a is None or b is None or a == b:
+            skipped += 1
+            continue
+        if rel.kind == "alternative" and a > b:
+            a, b = b, a
+        cur.execute(
+            """
+            INSERT INTO project_relations (a, b, kind, why, job_id)
+            VALUES (%s, %s, %s, %s, %s)
+            ON CONFLICT (a, b, kind) DO UPDATE SET
+                why = EXCLUDED.why, job_id = EXCLUDED.job_id, updated_at = NOW()
+            """,
+            (a, b, rel.kind, rel.why, job["id"]),
+        )
+        stored += 1
+    return {"relations": stored, "skipped": skipped}
+
+
+@app.get("/relations")
+def relations():
+    """Relations between catalogue projects, for linking them (the wiki)."""
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT r.id, r.a, pa.code AS a_code, pa.name AS a_name,
+                       r.b, pb.code AS b_code, pb.name AS b_name,
+                       r.kind, r.why, r.updated_at
+                FROM project_relations r
+                JOIN projects pa ON pa.id = r.a JOIN projects pb ON pb.id = r.b
+                ORDER BY r.a, r.b, r.kind
+                """
+            )
+            return cur.fetchall()
+
+
+@app.get("/categories")
+def categories():
+    """Every need category, briefed or not, with its latest brief (or
+    null) and whether discovery covers it (``focus``): the wiki's
+    browse tree."""
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT c.id, c.layer, c.name, c.scope, COALESCE(c.track, 'need') AS track,
+                       COALESCE(c.layer = ANY(%s) OR c.track = %s, FALSE) AS focus,
+                       b.brief, b.created_at AS brief_at
+                FROM need_categories c
+                LEFT JOIN LATERAL (
+                    SELECT brief, created_at FROM need_briefs WHERE category_id = c.id
+                    ORDER BY created_at DESC, id DESC LIMIT 1) b ON TRUE
+                ORDER BY (COALESCE(c.track, 'need') = %s), c.layer NULLS LAST, c.name
+                """,
+                (list(research.DISCOVERY_LAYERS), research.ENABLER, research.ENABLER),
+            )
+            return cur.fetchall()
 
 
 # ---------------------------------------------------------------------------
@@ -1780,6 +1892,8 @@ def complete_job(job_id: int, item: JobComplete):
                  if job_type == research.BUILD_PACK else None)
         stage2 = (modular.validate(job_type, item.output)
                   if job_type in modular.JOB_TYPES else None)
+        relations = (research.RelationsResult(**item.output)
+                     if job_type == research.RELATIONS else None)
         if assessment is not None:
             # Only an enabler lists the needs it serves (section 2a).
             assessment.serves = list(dict.fromkeys(
@@ -1872,6 +1986,8 @@ def complete_job(job_id: int, item: JobComplete):
                     )
                 elif stage2 is not None:
                     extra = _store_modular(cur, result, stage2)
+                elif relations is not None:
+                    extra = _store_relations(cur, result, relations)
                 elif job_type == research.LITERATURE and result["question_id"]:
                     cur.execute(
                         "UPDATE questions SET status = 'answered' "
