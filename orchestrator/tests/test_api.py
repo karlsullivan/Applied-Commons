@@ -710,3 +710,12 @@ def test_design_sources_are_listed_for_archiving_once(client):
     assert [p["kind"] for p in client.get("/archives/pending").json()] == ["file"]  # retried
     record = client.get(f"/projects/{pid}/record").json()
     assert {a["status"] for a in record["archives"]} == {"archived", "failed"}
+
+
+def test_build_instructions_cover_software_projects():
+    import research
+
+    project = {"name": "Open Food Facts", "code": "c3-off", "category": "Food",
+               "summary": "An open food database.", "sources": []}
+    for section in research.BUILD_SECTIONS:
+        assert "software or data" in research.build_input(project, section)["instructions"]

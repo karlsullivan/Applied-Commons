@@ -290,3 +290,7 @@ The need is established first (need briefs, section 4a); the existing screening 
 The build gate is automatic, with maintainer override (section 4d).
 
 Design files are kept as pinned local copies when their licence allows (section 4c).
+
+2026-10-07:
+
+Software and data projects stay in the catalogue. Their build pack documents a working deployment: the hardware, hosting and services needed with their costs; source repositories, data and configuration; installation and deployment; and verification of a running instance.

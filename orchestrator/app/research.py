@@ -507,8 +507,9 @@ def review_input(project: dict, review_number: int) -> dict[str, Any]:
         "instructions": (
             "Decide whether this project deserves a full build pack: a priced "
             "bill of materials, design files (CAD, schematics, PCB, firmware), "
-            "assembly steps and a test procedure, so someone can build it. "
-            "Use the research findings above and check anything material "
+            "assembly steps and a test procedure, so someone can build it "
+            "(for a software or data project: what it takes to deploy and run "
+            "it). Use the research findings above and check anything material "
             "against the sources. Re-score each dimension from 0 to 1 with "
             "the evidence now available (same meanings as the assessment). "
             "In fit, say how the project meets the need brief's requirements "
@@ -586,6 +587,18 @@ _SECTION_TASKS = {
 }
 
 
+#: Software and data projects stay in the catalogue; their build pack
+#: documents a working deployment (maintainer decision 2026-10-07).
+_SOFTWARE = (
+    "If the project is software or data rather than a physical device, "
+    "document a working deployment instead: the bill of materials is the "
+    "hardware, hosting and services it needs, with their costs; the design "
+    "files are its source repositories, data downloads and configuration; "
+    "assembly is installation and deployment; test is verifying a running "
+    "instance."
+)
+
+
 def build_input(project: dict, section: str) -> dict[str, Any]:
     """One section of a build pack (policy section 4c)."""
     task, fmt = _SECTION_TASKS[section]
@@ -600,8 +613,8 @@ def build_input(project: dict, section: str) -> dict[str, Any]:
         "sources": project["sources"],
         "instructions": (
             f"Build pack, section '{section}', for this open-source project. "
-            f"{task} List gaps: what the upstream project does not document "
-            f"for this section. {_COMMON}"
+            f"{task} {_SOFTWARE} List gaps: what the upstream project does not "
+            f"document for this section. {_COMMON}"
         ),
         "output_format": (
             '{"summary": "<one paragraph>", "build": ' + fmt + ', "evidence": '
