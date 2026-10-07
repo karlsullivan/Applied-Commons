@@ -31,6 +31,14 @@ Interpret requests semantically. Keyword matches alone must not determine admiss
 
 Explain the link between the work and the need. A remote possibility that a technology might eventually benefit humanity is insufficient for admission. Models may suggest classification changes, but may not expand the mission or rewrite this policy during an investigation.
 
+2a. Enablers
+
+Some work is not a need in itself but something many needs depend on: energy, communications and information, environment and climate (taxonomy.md, Enablers). Enablers form a track alongside the layers rather than a layer of their own. Each enabler category has its own need brief, framed by the essential needs that depend on it, and its own discovery.
+
+An enabler project is screened on the needs it serves: its assessment lists the physiological and safety need categories it directly makes easier to meet, and the project takes the most basic layer among them for the need-layer score. The other dimensions are scored on those needs. Environment and climate as an enabler (carbon removal, ecosystem restoration, adaptation) is distinct from the Safety category Environmental stability and resource security (exposure and access), and both remain.
+
+Enablers compete for the same slots under the same rubric and thresholds, with a slight attention bump: their pipeline steps queue a little ahead, and admission orders them as if their composite were 0.05 higher. The recorded composite is not changed.
+
 3. Admission requirements
 
 Every candidate must address the following six requirements. Distinguish established facts, estimates, assumptions and unknowns. Early feasibility work may investigate missing evidence; development admission requires a sufficiently credible case and a defined route to testing it.
@@ -294,3 +302,5 @@ Design files are kept as pinned local copies when their licence allows (section 
 2026-10-07:
 
 Software and data projects stay in the catalogue. Their build pack documents a working deployment: the hardware, hosting and services needed with their costs; source repositories, data and configuration; installation and deployment; and verification of a running instance.
+
+Enablers are a track alongside the layers (section 2a), starting with Energy, Communications and information, and Environment and climate; more may be added. Environmental enablers and the environmental Safety need both stay. Enablers compete equally for slots, with a slight attention bump.

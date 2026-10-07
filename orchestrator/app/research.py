@@ -50,6 +50,17 @@ STEERS = ("build", "park")
 DISCOVERY_LAYERS = (1, 2)
 DISCOVERY_PERIOD_DAYS = 14
 
+#: Enablers (policy section 2a): categories alongside the layers, such as
+#: energy, that many needs depend on. An enabler project takes the most
+#: basic layer among the needs it serves. It competes on the same rubric
+#: and thresholds, with a slight attention bump: its pipeline steps queue
+#: a little ahead, and ENABLER_ATTENTION is added to its composite when
+#: ordering admissions (the recorded composite is unchanged).
+ENABLER = "enabler"
+ENABLER_ATTENTION = 0.05
+ENABLER_DISCOVERY_PRIORITY = 0.65
+ENABLER_ASSESSMENT_PRIORITY = 0.75
+
 #: Rubric v1 weights (sum to 1). The evidence score is not weighted in;
 #: it scales the composite (see composite_score).
 WEIGHTS = {
@@ -125,6 +136,8 @@ class Assessment(BaseModel):
     requirements: dict[str, str]
     rationale: str = Field(min_length=20, max_length=4000)
     questions: list[str] = Field(default_factory=list, max_length=5)
+    #: Enablers only: the need categories it serves (by name).
+    serves: list[str] = Field(default_factory=list, max_length=14)
 
     @field_validator("scores")
     @classmethod
@@ -358,6 +371,8 @@ _COMMON = (
 
 
 def need_brief_input(category: dict) -> dict[str, Any]:
+    if category.get("track") == ENABLER:
+        return _enabler_brief_input(category)
     return {
         "category": category["name"],
         "layer": category["layer"],
@@ -378,15 +393,44 @@ def need_brief_input(category: dict) -> dict[str, Any]:
             f"so make the requirements specific enough to test against. "
             f"{_COMMON}"
         ),
-        "output_format": (
-            '{"summary": "<one paragraph>", "brief": {"users": "<who and where, '
-            'with numbers>", "severity": "<how severe and persistent>", '
-            '"current_practice": "<what people do now and its cost>", '
-            '"requirements": ["<measurable requirement>"], "constraints": '
-            '["<practical constraint>"], "gaps": "<where existing solutions '
-            'fall short>"}, "evidence": [{"source_uri": "<url>", "title": "", '
-            '"source_type": ""}]}'
+        "output_format": _BRIEF_FORMAT,
+    }
+
+
+_BRIEF_FORMAT = (
+    '{"summary": "<one paragraph>", "brief": {"users": "<who and where, '
+    'with numbers>", "severity": "<how severe and persistent>", '
+    '"current_practice": "<what people do now and its cost>", '
+    '"requirements": ["<measurable requirement>"], "constraints": '
+    '["<practical constraint>"], "gaps": "<where existing solutions '
+    'fall short>"}, "evidence": [{"source_uri": "<url>", "title": "", '
+    '"source_type": ""}]}'
+)
+
+
+def _enabler_brief_input(category: dict) -> dict[str, Any]:
+    return {
+        "category": category["name"],
+        "track": ENABLER,
+        "scope": category["scope"],
+        "instructions": (
+            f"Write a need brief for this enabler: {category['name']} - "
+            f"{category['scope']} An enabler is not a need in itself; it is "
+            f"something essential needs (water, food, sanitation, shelter, "
+            f"health, safety) depend on. Establish, from authoritative sources "
+            f"(IEA, ITU, IPCC, UN agencies, World Bank, peer-reviewed studies, "
+            f"field organisations): which essential needs depend on it, for "
+            f"whom and where, with numbers (users); how much its absence harms "
+            f"those needs (severity); what people currently do and what that "
+            f"costs (current_practice); the requirements a good open, locally "
+            f"buildable solution must meet to serve those needs, measurable "
+            f"where possible (for example 'powers a 50 W pump for 6 hours a "
+            f"day', 'under US$0.20 per kWh over its life'); practical "
+            f"constraints; and where existing solutions fall short (gaps). "
+            f"Frame every requirement by the essential need it serves. "
+            f"{_COMMON}"
         ),
+        "output_format": _BRIEF_FORMAT,
     }
 
 
@@ -394,15 +438,20 @@ def discovery_input(category: dict, known: list[str],
                     brief: dict | None = None) -> dict[str, Any]:
     against = ("Prefer candidates that can meet the need brief's requirements "
                "within its constraints. " if brief else "")
+    enabler = category.get("track") == ENABLER
+    what = (f"that provide this enabler for essential human needs (water, food, "
+            f"sanitation, shelter, health, safety): " if enabler
+            else "that address this human need: ")
     return {
         "category": category["name"],
         "layer": category["layer"],
+        **({"track": ENABLER} if enabler else {}),
         "scope": category["scope"],
         **({"need_brief": brief} if brief else {}),
         "already_known": known[:100],
         "instructions": (
             f"Find up to 8 existing open-source projects (hardware or software, "
-            f"with public designs or code) that address this human need: "
+            f"with public designs or code) {what}"
             f"{category['name']} - {category['scope']} {against}Prefer mature, "
             f"documented, low-cost, locally buildable and maintainable work. "
             f"Skip projects listed in already_known. {_COMMON}"
@@ -422,15 +471,36 @@ def assessment_input(project: dict) -> dict[str, Any]:
         "project meets, partly meets or misses, within its constraints. "
         if brief else ""
     )
+    options = project.get("serves_options") or []
+    enabler = project.get("track") == ENABLER
+    serves = (
+        "This is an enabler: in serves, list the need categories (from "
+        "serves_options, exact names) that it directly makes easier to meet, "
+        "most important first; score need_severity_reach on those needs. "
+        if enabler else ""
+    )
+    output_format = (
+        '{"summary": "<one paragraph>", "assessment": {"scores": '
+        '{"need_severity_reach": 0.0, "effectiveness": 0.0, "ease": 0.0, '
+        '"cost": 0.0, "practicality": 0.0, "evidence": 0.0}, '
+        '"requirements": {"need": "", "baseline": "", "improvement": "", '
+        '"demonstration": "", "burden_removed": "", '
+        '"practical_independence": ""}, "rationale": "<why these scores>", '
+        '"questions": ["<question>"]'
+        + (', "serves": ["<need category>"]' if enabler else "")
+        + '}, "evidence": [{"source_uri": "<url>", "title": "", '
+        '"source_type": ""}]}'
+    )
     return {
         "project": project["name"],
         "category": project["category"],
         "layer": project["layer"],
+        **({"track": ENABLER, "serves_options": options} if enabler else {}),
         "summary": project["summary"],
         "source_uris": project["source_uris"],
         **({"need_brief": brief} if brief else {}),
         "instructions": (
-            f"Assess this open-source project for Applied Commons. {against}"
+            f"Assess this open-source project for Applied Commons. {serves}{against}"
             "Score each "
             "dimension from 0 to 1 using the evidence you retrieve: "
             "need_severity_reach (how severe the need is and how many people "
@@ -447,17 +517,15 @@ def assessment_input(project: dict) -> dict[str, Any]:
             "the evidence does not say. Propose up to 3 immediate engineering "
             f"questions whose answers would most improve the project. {_COMMON}"
         ),
-        "output_format": (
-            '{"summary": "<one paragraph>", "assessment": {"scores": '
-            '{"need_severity_reach": 0.0, "effectiveness": 0.0, "ease": 0.0, '
-            '"cost": 0.0, "practicality": 0.0, "evidence": 0.0}, '
-            '"requirements": {"need": "", "baseline": "", "improvement": "", '
-            '"demonstration": "", "burden_removed": "", '
-            '"practical_independence": ""}, "rationale": "<why these scores>", '
-            '"questions": ["<question>"]}, "evidence": [{"source_uri": "<url>", '
-            '"title": "", "source_type": ""}]}'
-        ),
+        "output_format": output_format,
     }
+
+
+def enabler_layer(serves: list[str], layers: dict[str, int]) -> int | None:
+    """An enabler's layer: the most basic layer among the need categories
+    it serves (``layers`` maps category name to layer)."""
+    served = [layers[name] for name in serves if name in layers]
+    return min(served) if served else None
 
 
 def literature_input(question: dict) -> dict[str, Any]:

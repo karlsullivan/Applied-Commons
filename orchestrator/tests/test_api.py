@@ -265,7 +265,7 @@ def test_status_endpoints_validate(client):
 # Autonomous research pipeline (rubric v1)
 # ---------------------------------------------------------------------------
 
-FOCUS_CATEGORIES = 14  # layers 1 and 2 of the needs taxonomy
+FOCUS_CATEGORIES = 17  # layers 1 and 2 of the needs taxonomy, plus 3 enablers
 
 
 def discover(client, limit=200):
@@ -329,7 +329,7 @@ def seed_briefs():
     from psycopg.types.json import Jsonb
 
     sql("INSERT INTO need_briefs (category_id, brief) "
-        "SELECT id, %s FROM need_categories WHERE layer <= 2", Jsonb(BRIEF))
+        "SELECT id, %s FROM need_categories WHERE layer <= 2 OR track = 'enabler'", Jsonb(BRIEF))
 
 
 def test_briefs_come_first_and_gate_discovery(client):
@@ -488,7 +488,7 @@ def test_portfolio_ranks_projects(client):
 def test_summary_counts_the_pipeline_and_the_queue(client):
     empty = client.get("/summary").json()
     assert empty["pipeline"]["candidates"] == 0
-    assert empty["pipeline"]["need_categories"] == 20
+    assert empty["pipeline"]["need_categories"] == 23
 
     seed_briefs()
     discover(client, limit=1)
@@ -719,3 +719,96 @@ def test_build_instructions_cover_software_projects():
                "summary": "An open food database.", "sources": []}
     for section in research.BUILD_SECTIONS:
         assert "software or data" in research.build_input(project, section)["instructions"]
+
+
+# ---------------------------------------------------------------------------
+# Enablers (policy section 2a)
+# ---------------------------------------------------------------------------
+
+
+def complete(client, job, output):
+    r = client.post(f"/jobs/{job['id']}/complete", json={"worker": APOLLO, "output": output})
+    assert r.status_code == 200, r.text
+    return r
+
+
+def enabler_candidate(client, name="Solar Water Pump"):
+    """Discover one enabler candidate (enabler discovery queues first)."""
+    seed_briefs()
+    discover(client)
+    job = claim(client, APOLLO, ["candidate-discovery"]).json()["job"]
+    assert job["input"]["track"] == "enabler"
+    assert "essential human needs" in job["input"]["instructions"]
+    complete(client, job, candidates(name))
+    return job
+
+
+def test_enablers_are_screened_on_the_needs_they_serve(client):
+    import research
+
+    enabler_candidate(client)
+    assert sql("SELECT maslow_level FROM projects") == [(None,)]
+    discover(client)
+    job = claim(client, APOLLO, ["candidate-assessment"]).json()["job"]
+    assert job["priority"] == research.ENABLER_ASSESSMENT_PRIORITY
+    assert job["input"]["track"] == "enabler" and len(job["input"]["serves_options"]) == 14
+    assert '"serves"' in job["input"]["output_format"]
+    output = strong_assessment()
+    output["assessment"]["serves"] = ["Physical and mental health", "Water", "Not a category"]
+    r = complete(client, job, output)
+    [(level, serves, score)] = sql("SELECT maslow_level, serves, score FROM projects")
+    assert level == 1  # Water is layer 1, the most basic it serves
+    assert serves == ["Physical and mental health", "Water"]
+    assert score == r.json()["composite"] == research.composite_score(
+        1, output["assessment"]["scores"])
+    row = client.get("/catalogue").json()["projects"][0]
+    assert (row["track"], row["layer"], row["serves"]) == ("enabler", 1, serves)
+
+
+@pytest.mark.parametrize("serves", [[], ["Not a category"]])
+def test_an_enabler_screening_must_say_what_it_serves(client, serves):
+    enabler_candidate(client)
+    discover(client)
+    output = strong_assessment()
+    output["assessment"]["serves"] = serves
+    job = claim(client, APOLLO, ["candidate-assessment"]).json()["job"]
+    r = client.post(f"/jobs/{job['id']}/complete", json={"worker": APOLLO, "output": output})
+    assert r.status_code == 422
+    assert sql("SELECT count(*) FROM assessments") == [(0,)]
+
+
+def test_a_need_screening_ignores_serves(client):
+    seed_briefs()
+    discover(client, limit=1)
+    run_job(client, "candidate-discovery", candidates("Slow Sand Filter"))
+    discover(client)
+    output = strong_assessment()
+    output["assessment"]["serves"] = ["Water"]
+    jobs = [claim(client, APOLLO, ["candidate-assessment"]).json()["job"]]
+    assert "track" not in jobs[0]["input"]
+    complete(client, jobs[0], output)
+    assert sql("SELECT maslow_level, serves FROM projects") == [(1, [])]
+
+
+def test_enablers_get_a_slight_admission_bump(client, monkeypatch):
+    monkeypatch.setenv("MAX_ACTIVE_PROJECTS", "1")
+    enabler_candidate(client, "Solar Water Pump")
+    while True:  # the other enabler discoveries queue ahead of the needs
+        need_job = claim(client, APOLLO, ["candidate-discovery"]).json()["job"]
+        if "track" not in need_job["input"]:
+            break
+        complete(client, need_job, {"summary": "s", "candidates": []})
+    complete(client, need_job, candidates("Rope Pump"))
+    discover(client)
+    for _ in range(2):
+        job = claim(client, APOLLO, ["candidate-assessment"]).json()["job"]
+        if job["input"].get("track") == "enabler":
+            output = strong_assessment(cost=0.8)
+            output["assessment"]["serves"] = ["Water"]
+        else:
+            output = strong_assessment(cost=0.9)
+        complete(client, job, output)
+    scores = dict(sql("SELECT name, score FROM projects"))
+    assert scores["Rope Pump"] > scores["Solar Water Pump"]  # recorded honestly
+    assert len(discover(client)["admitted"]) == 1
+    assert sql("SELECT name FROM projects WHERE status = 'active'") == [("Solar Water Pump",)]

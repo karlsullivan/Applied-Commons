@@ -20,3 +20,16 @@
 | 4                                | Autonomy and productive capability            | Making meaningful choices, contributing through useful work and exercising control over daily life.                  |
 | **5 — Self-actualisation**       | Creativity and discovery                      | Creative expression, scientific enquiry, exploration and developing personal potential.                              |
 | 5                                | Meaning and purposeful contribution           | Personal growth, purposeful activity and contributing to something people value.                                     |
+
+## Enablers
+
+Enablers sit alongside the layers rather than in them: many needs at every
+layer depend on them. An enabler project is assessed on the need categories
+above that it serves, and takes the most basic layer among them
+(project-selection.md, section 2a).
+
+| Enabler                        | What it covers                                                                                                    |
+| ------------------------------ | ----------------------------------------------------------------------------------------------------------------- |
+| Energy                         | Generation, storage and distribution of energy that essential needs depend on: off-grid and small-grid power, efficient end use, cooking and pumping energy. |
+| Communications and information | Connectivity and information systems that essential needs depend on: low-cost networks, early warning, access to health, market and technical information. |
+| Environment and climate        | Environmental systems all needs depend on: carbon removal and durable storage, ecosystem restoration, climate adaptation. Exposure to pollution and access to resources stay under Environmental stability and resource security (layer 2). |

@@ -365,12 +365,22 @@ def _unit_exists(cur, unit_key) -> bool:
 
 
 def _focus_categories(cur) -> list:
+    """The focus-layer need categories, then the enablers (section 2a)."""
     cur.execute(
-        "SELECT id, layer, name, scope FROM need_categories "
-        "WHERE layer = ANY(%s) ORDER BY layer, id",
-        (list(research.DISCOVERY_LAYERS),),
+        "SELECT id, layer, name, scope, track FROM need_categories "
+        "WHERE layer = ANY(%s) OR track = %s ORDER BY layer NULLS LAST, id",
+        (list(research.DISCOVERY_LAYERS), research.ENABLER),
     )
     return cur.fetchall()
+
+
+def _need_layers(cur) -> dict[str, int]:
+    """Focus-layer need category name -> layer: what an enabler can serve."""
+    cur.execute(
+        "SELECT name, layer FROM need_categories WHERE layer = ANY(%s) ORDER BY layer, id",
+        (list(research.DISCOVERY_LAYERS),),
+    )
+    return {r["name"]: r["layer"] for r in cur.fetchall()}
 
 
 def _latest_brief(cur, category_id) -> dict | None:
@@ -431,9 +441,11 @@ def _discover_candidates(cur, budget: int) -> list:
         known = [r["name"] for r in cur.fetchall()]
         payload = {"category_id": category["id"],
                    **research.discovery_input(category, known, brief)}
+        priority = (research.ENABLER_DISCOVERY_PRIORITY
+                    if category["track"] == research.ENABLER
+                    else research.LAYER_SCORE[category["layer"]] * 0.6)
         job = _enqueue(cur, unit_key=key, job_type=research.DISCOVERY,
-                       priority=research.LAYER_SCORE[category["layer"]] * 0.6,
-                       payload=payload)
+                       priority=priority, payload=payload)
         if job:
             created.append(job)
     return created
@@ -444,14 +456,15 @@ def _assess_candidates(cur, budget: int) -> list:
     cur.execute(
         """
         SELECT p.id, p.name, p.summary, p.source_uris, p.maslow_level AS layer,
-               c.name AS category, p.category_id
+               c.name AS category, p.category_id, c.track
         FROM projects p JOIN need_categories c ON c.id = p.category_id
         WHERE p.status = 'candidate'
           AND NOT EXISTS (SELECT 1 FROM assessments a WHERE a.project_id = p.id)
-        ORDER BY p.maslow_level, p.id
+        ORDER BY p.maslow_level NULLS LAST, p.id
         """
     )
     created = []
+    options = None
     for project in cur.fetchall():
         if len(created) >= budget:
             break
@@ -459,8 +472,14 @@ def _assess_candidates(cur, budget: int) -> list:
         if _unit_exists(cur, key):
             continue
         project["brief"] = _latest_brief(cur, project["category_id"])
+        if project["track"] == research.ENABLER:
+            options = options if options is not None else list(_need_layers(cur))
+            project["serves_options"] = options
+            priority = research.ENABLER_ASSESSMENT_PRIORITY
+        else:
+            priority = research.LAYER_SCORE[project["layer"]] * 0.7
         job = _enqueue(cur, unit_key=key, job_type=research.ASSESSMENT,
-                       priority=research.LAYER_SCORE[project["layer"]] * 0.7,
+                       priority=priority,
                        payload=research.assessment_input(project),
                        project_id=project["id"])
         if job:
@@ -477,9 +496,10 @@ def _admit(cur) -> list:
     cur.execute(
         """
         SELECT DISTINCT ON (p.id) p.id, p.name, p.source_uris, a.composite,
-               a.scores, a.requirements, a.rationale,
+               a.scores, a.requirements, a.rationale, c.track,
                (SELECT count(*) FROM evidence e WHERE e.project_id = p.id) AS evidence_rows
         FROM projects p JOIN assessments a ON a.project_id = p.id
+        LEFT JOIN need_categories c ON c.id = p.category_id
         WHERE p.status = 'candidate'
         ORDER BY p.id, a.created_at DESC
         """
@@ -491,7 +511,10 @@ def _admit(cur) -> list:
         and research.admission_case_made(row["requirements"])
         and len(row["source_uris"]) + row["evidence_rows"] >= research.ADMIT_MIN_SOURCES
     ]
-    eligible.sort(key=lambda r: (-r["composite"], r["id"]))
+    # Enablers get a slight attention bump in the order (section 2a).
+    eligible.sort(key=lambda r: (
+        -(r["composite"] + (research.ENABLER_ATTENTION
+                            if r["track"] == research.ENABLER else 0)), r["id"]))
     admitted = []
     for row in eligible[:slots]:
         cur.execute("UPDATE projects SET status = 'active' WHERE id = %s", (row["id"],))
@@ -836,6 +859,7 @@ def catalogue():
                 SELECT p.id, p.code, p.name, p.status, {_STAGE_SQL} AS stage,
                        p.maslow_level AS layer, c.name AS category, p.score,
                        p.summary, p.source_uris, p.steer, p.steer_note,
+                       COALESCE(c.track, 'need') AS track, p.serves,
                        (SELECT d.decision FROM decisions d WHERE d.project_id = p.id
                         ORDER BY d.id DESC LIMIT 1) AS decision,
                        (SELECT count(*) FROM questions q WHERE q.project_id = p.id
@@ -872,7 +896,7 @@ def briefs():
             cur.execute(
                 """
                 SELECT DISTINCT ON (c.id) c.id AS category_id, c.layer, c.name,
-                       c.scope, b.brief, b.created_at
+                       c.scope, c.track, b.brief, b.created_at
                 FROM need_categories c JOIN need_briefs b ON b.category_id = c.id
                 ORDER BY c.id, b.created_at DESC, b.id DESC
                 """
@@ -892,6 +916,7 @@ def project_record(project_id: int):
                 SELECT p.id, p.code, p.name, p.status, {_STAGE_SQL} AS stage,
                        p.maslow_level AS layer, c.name AS category, p.category_id,
                        p.score, p.summary, p.source_uris, p.steer, p.steer_note,
+                       COALESCE(c.track, 'need') AS track, p.serves,
                        p.created_at
                 FROM projects p LEFT JOIN need_categories c ON c.id = p.category_id
                 WHERE p.id = %s
@@ -1295,6 +1320,8 @@ def complete_job(job_id: int, item: JobComplete):
         with conn.cursor() as cur:
             cur.execute("SELECT job_type, input FROM jobs WHERE id = %s", (job_id,))
             row = cur.fetchone()
+            enabler = bool(row) and (row["input"] or {}).get("track") == research.ENABLER
+            need_layers = _need_layers(cur) if enabler else {}
     job_type = row["job_type"] if row else None
     section = (row["input"] or {}).get("section") if row else None
     try:
@@ -1314,6 +1341,13 @@ def complete_job(job_id: int, item: JobComplete):
                   if job_type == research.REVIEW else None)
         build = (research.validate_build(section, item.output)
                  if job_type == research.BUILD_PACK else None)
+        if assessment is not None:
+            # Only an enabler lists the needs it serves (section 2a).
+            assessment.serves = list(dict.fromkeys(
+                s for s in assessment.serves if s in need_layers)) if enabler else []
+            if enabler and not assessment.serves:
+                raise ValueError("an enabler's assessment must list the need "
+                                 "categories it serves, by name")
     except (TypeError, ValueError, KeyError) as exc:
         raise HTTPException(
             status_code=422,
@@ -1444,8 +1478,13 @@ def _store_candidates(cur, job, discovery) -> dict:
 
 def _store_assessment(cur, job, assessment) -> dict:
     project_id = job["project_id"]
-    cur.execute("SELECT maslow_level FROM projects WHERE id = %s", (project_id,))
-    layer = cur.fetchone()["maslow_level"]
+    if assessment.serves:  # an enabler: it takes the layer of what it serves
+        layer = research.enabler_layer(assessment.serves, _need_layers(cur))
+        cur.execute("UPDATE projects SET maslow_level = %s, serves = %s WHERE id = %s",
+                    (layer, Jsonb(assessment.serves), project_id))
+    else:
+        cur.execute("SELECT maslow_level FROM projects WHERE id = %s", (project_id,))
+        layer = cur.fetchone()["maslow_level"]
     composite = research.composite_score(layer, assessment.scores)
     cur.execute(
         """
