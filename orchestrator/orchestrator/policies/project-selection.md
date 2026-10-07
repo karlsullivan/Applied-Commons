@@ -338,3 +338,7 @@ Before trials, a modular set (section 4e): interface standards approved by the m
 Proposed standards are verified against established standards (ISO, IEC, EN/DIN, AS/NZS) before approval, with deviations called out (section 4e): nothing unsafe, without heavy overhead.
 
 The published catalogue is navigable by layer, category and project, with related projects linked across categories (section 4f).
+
+Applied Commons is primarily for the public good. Apollo Automation (the maintainer's company) may take on projects where there is an opportunity; that does not change how work is prioritised here.
+
+A need is done when modules tested in the real world substantially solve the problem its brief describes; continuous improvement (stage 4) then closes the remaining gaps.
