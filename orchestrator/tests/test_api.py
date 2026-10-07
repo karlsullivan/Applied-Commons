@@ -929,7 +929,7 @@ def roadmap_out():
 
 def verify_standards():
     """Mark every standard's current spec verified (as a verification would)."""
-    sql("UPDATE standards SET verified_hash = "
+    sql("UPDATE standards SET verified_at = NOW(), verified_hash = "
         "left(encode(sha256(convert_to(spec, 'UTF8')), 'hex'), 16)")
     sql("UPDATE jobs SET status = 'completed' WHERE job_type = 'standard-verification'")
 
@@ -1378,3 +1378,162 @@ def test_invalid_progress_writes_nothing(client):
         {"requirement": 1, "level": "nearly", "met_by": []}))
     assert r.status_code == 422
     assert sql("SELECT count(*) FROM need_progress") == [(0,)]
+
+
+def approved_standard(client):
+    """dc-bus-24v approved over a week ago, used by one module."""
+    from psycopg.types.json import Jsonb
+
+    screened(10)
+    discover(client)
+    run_job(client, "standards-synthesis", {"summary": "s", "standards": [STANDARD]})
+    approve_first_standard(client)
+    sql("UPDATE standards SET decided_at = NOW() - INTERVAL '8 days'")
+    sql("INSERT INTO modules (code, name, kind, domain, maturity, standards, spec) "
+        "VALUES ('solar-pump', 'Solar pump', 'hardware', 'Water', 'concept', %s, %s)",
+        Jsonb(["dc-bus-24v"]), Jsonb({"purpose": "Pumps.", "domains": ["Water"]}))
+    sql("UPDATE jobs SET status = 'completed' WHERE status = 'queued'")
+    [(sid,)] = sql("SELECT id FROM standards WHERE code = 'dc-bus-24v'")
+    return sid
+
+
+def test_approved_standards_get_a_monthly_fit_review(client):
+    import modular
+
+    approved_standard(client)
+    sql("DELETE FROM jobs WHERE job_type = 'standards-review'")
+    step = discover(client)["modular"]
+    [job] = [j for j in step if j["job_type"] == "standards-review"]
+    assert job["unit_key"] == f"standards-review:{modular.month()}"
+    [(payload,)] = sql("SELECT input FROM jobs WHERE job_type = 'standards-review'")
+    [std] = payload["approved_standards"]
+    assert std["code"] == "dc-bus-24v"
+    assert std["adoption"] == {"modules": 1, "module_codes": ["solar-pump"], "systems": 0}
+    assert "every module" in payload["instructions"]
+    assert not [j for j in discover(client)["modular"] if j["job_type"] == "standards-review"]
+
+
+def test_a_revision_supersedes_the_standard_once_approved(client):
+    approved_standard(client)
+    sql("DELETE FROM jobs WHERE job_type = 'standards-review'")
+    discover(client)
+    _, r = run_job(client, "standards-review", {"summary": "s", "reviews": [{
+        "code": "dc-bus-24v", "recommendation": "revise",
+        "rationale": "Most new designs use 48 V for pumps over 500 W.",
+        "conflicts": [{"finding": "Three new pump projects use 48 V.", "source": "P Water 3"}],
+        "revision": {**STANDARD, "code": "dc-bus-24v", "name": "24/48 V DC bus",
+                     "spec": "24 V or 48 V nominal DC, XT90 above 30 A."}}]})
+    assert r.status_code == 200, r.text
+    assert r.json()["reviews"] == 1 and r.json()["revisions"] == 1
+    standards = {s["code"]: s for s in client.get("/standards").json()}
+    old = standards["dc-bus-24v"]
+    [new_code] = [c for c in standards if c != "dc-bus-24v"]
+    new = standards[new_code]
+    assert new_code.startswith("dc-bus-24v-rev-") and new["status"] == "proposed"
+    assert new["supersedes"] == "dc-bus-24v" and old["superseded_by"] == new_code
+    assert old["review"]["recommendation"] == "revise"
+    assert old["review"]["conflicts"][0]["source"] == "P Water 3"
+    assert old["adoption"]["modules"] == 1
+    # Verified, then approved: the old standard is superseded, and modules
+    # are told to move over.
+    verify_standards()
+    r = client.post(f"/standards/{new['id']}/decision", json={"decision": "approved"})
+    assert r.status_code == 200
+    statuses = {s["code"]: s["status"] for s in client.get("/standards").json()}
+    assert statuses == {"dc-bus-24v": "superseded", new_code: "approved"}
+    sql("DELETE FROM jobs WHERE job_type = 'module-synthesis'")
+    discover(client)
+    [(payload,)] = sql("SELECT input FROM jobs WHERE job_type = 'module-synthesis' LIMIT 1")
+    assert payload["superseded_standards"] == {"dc-bus-24v": new_code}
+    assert [s["code"] for s in payload["approved_standards"]] == [new_code]
+
+
+def test_keep_and_retire_need_no_revision(client):
+    approved_standard(client)
+    sql("DELETE FROM jobs WHERE job_type = 'standards-review'")
+    discover(client)
+    _, r = run_job(client, "standards-review", {"summary": "s", "reviews": [{
+        "code": "dc-bus-24v", "recommendation": "retire", "rationale": "Nothing uses it now.",
+        "revision": {**STANDARD, "code": "ignored"}}]})
+    assert r.json()["revisions"] == 0
+    assert [s["code"] for s in client.get("/standards").json()] == ["dc-bus-24v"]
+    assert client.get("/standards").json()[0]["review"]["recommendation"] == "retire"
+
+
+def test_a_revise_without_the_revision_is_refused(client):
+    approved_standard(client)
+    sql("DELETE FROM jobs WHERE job_type = 'standards-review'")
+    discover(client)
+    _, r = run_job(client, "standards-review", {"summary": "s", "reviews": [{
+        "code": "dc-bus-24v", "recommendation": "revise", "rationale": "Should change."}]})
+    assert r.status_code == 422
+
+
+def test_approved_standards_are_reverified_yearly(client):
+    approved_standard(client)
+    assert not [j for j in discover(client)["modular"]
+                if j["job_type"] == "standard-verification"]
+    sql("UPDATE standards SET verified_at = NOW() - INTERVAL '366 days'")
+    [job] = [j for j in discover(client)["modular"] if j["job_type"] == "standard-verification"]
+    [(payload,)] = sql("SELECT input FROM jobs WHERE id = %s", job["id"])
+    assert payload["reverification"] is True
+    _, r = run_job(client, "standard-verification", {"summary": "s", "verification": {
+        "outcome": "deviates", "safety_critical": True, "recommendation": "revise",
+        "rationale": "IEC 60364-7-712 was revised; fusing now differs.",
+        "deviations": [{"reference": "IEC 60364-7-712", "deviation": "Fuse rating.",
+                        "risk": "medium"}]}})
+    assert r.status_code == 200 and r.json()["verified"]
+    [std] = client.get("/standards").json()
+    assert std["status"] == "approved" and std["verification"]["recommendation"] == "revise"
+
+
+def safety_out(verdict="ok", *hazards):
+    return {"summary": "s", "safety": {"verdict": verdict,
+                                       "summary": "A low-voltage solar cooker with few hazards.",
+                                       "hazards": list(hazards)}}
+
+
+def test_completed_build_packs_get_a_safety_review(client):
+    from psycopg.types.json import Jsonb
+
+    pid = project(client, code="SAFE-1")
+    sql("UPDATE projects SET status = 'completed', summary = 'A box cooker.' WHERE id = %s", pid)
+    for section in ("bom", "assembly"):
+        sql("INSERT INTO build_packs (project_id, section, content) VALUES (%s, %s, %s)",
+            pid, section, Jsonb({"items": [], "steps": [{"step": "Cut glass"}]}))
+    [job] = discover(client)["safety"]
+    assert job["unit_key"].startswith(f"safety-review:{pid}:")
+    [(payload,)] = sql("SELECT input FROM jobs WHERE id = %s", job["id"])
+    assert set(payload["build_pack"]) == {"bom", "assembly"}
+    assert discover(client)["safety"] == []
+    # The verdict is never milder than the hazards listed.
+    _, r = run_job(client, "safety-review", safety_out("ok", {
+        "kind": "electrical", "hazard": "Mains-powered backup heater.", "severity": "high",
+        "standards": ["IEC 60335-1"], "controls": ["RCD protection"], "covered": False}))
+    assert r.status_code == 200, r.text
+    assert r.json()["verdict"] == "qualified-person"
+    row = next(p for p in client.get("/catalogue").json()["projects"] if p["id"] == pid)
+    assert row["safety"] == "qualified-person"
+    record = client.get(f"/projects/{pid}/record").json()
+    assert record["safety"]["hazards"][0]["standards"] == ["IEC 60335-1"]
+    # A rewritten section brings a new review.
+    sql("INSERT INTO build_packs (project_id, section, content) VALUES (%s, 'test', %s)",
+        pid, Jsonb({"criteria": []}))
+    assert len(discover(client)["safety"]) == 1
+
+
+@pytest.mark.parametrize("hazard, verdict", [
+    ({"kind": "heat-fire", "hazard": "Hot glass lid.", "severity": "medium", "covered": True},
+     "ok"),
+    ({"kind": "heat-fire", "hazard": "Hot glass lid.", "severity": "medium"}, "controls-needed"),
+    ({"kind": "mechanical", "hazard": "Sharp edges.", "severity": "low"}, "ok"),
+    ({"kind": "gas-combustion", "hazard": "Biogas leak.", "severity": "high", "covered": True},
+     "qualified-person"),
+])
+def test_safety_verdict_floor(hazard, verdict):
+    import research
+
+    review = research.SafetyResult(**safety_out("ok", hazard)).safety
+    assert review.verdict == verdict
+    strict = research.SafetyResult(**safety_out("do-not-build", hazard)).safety
+    assert strict.verdict == "do-not-build"  # never made milder

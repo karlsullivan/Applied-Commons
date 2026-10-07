@@ -13,7 +13,7 @@ import os
 import re
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 RUBRIC_VERSION = "rubric-v1"
 POLICY_REVISION = ("project-selection 2026-10-06 (rubric v1 admission, need briefs, "
@@ -921,5 +921,120 @@ def progress_input(category: dict, requirements: list[str], projects: list[dict]
             '"none|candidate|documented|designed|field-tested", "met_by": '
             '[{"code": "<project, module or system code>", "how": ""}], "gap": ""}], '
             '"evidence": []}'
+        ),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Build pack safety review (policy section 4i)
+# ---------------------------------------------------------------------------
+
+SAFETY = "safety-review"
+SAFETY_PRIORITY = 0.8
+HAZARD_KINDS = ("electrical", "battery", "gas-combustion", "pressure", "heat-fire",
+                "structural", "water-food", "chemical", "mechanical",
+                "biological-medical", "radio", "other")
+SEVERITIES = ("low", "medium", "high")
+VERDICTS = ("ok", "controls-needed", "qualified-person", "do-not-build")
+#: Hazards that need a qualified person when severe (mains or high-current
+#: electricity, gas, pressure vessels, load-bearing structures, medical use).
+QUALIFIED_KINDS = ("electrical", "gas-combustion", "pressure", "structural",
+                   "biological-medical")
+
+
+class Hazard(BaseModel):
+    kind: str = "other"
+    hazard: str = Field(min_length=5, max_length=800)
+    severity: str = "medium"
+    standards: list[str] = Field(default_factory=list, max_length=8)
+    controls: list[str] = Field(default_factory=list, max_length=10)
+    covered: bool = False
+
+    @field_validator("kind")
+    @classmethod
+    def _kind(cls, value):
+        value = str(value or "").strip().lower()
+        return value if value in HAZARD_KINDS else "other"
+
+    @field_validator("severity")
+    @classmethod
+    def _severity(cls, value):
+        value = str(value or "").strip().lower()
+        return value if value in SEVERITIES else "medium"
+
+    @field_validator("standards", "controls")
+    @classmethod
+    def _texts(cls, items):
+        return [str(i)[:300] for i in items]
+
+
+class SafetyReview(BaseModel):
+    verdict: str
+    summary: str = Field(min_length=20, max_length=3000)
+    hazards: list[Hazard] = Field(default_factory=list, max_length=20)
+
+    @field_validator("verdict")
+    @classmethod
+    def _verdict(cls, value):
+        value = str(value).strip().lower()
+        if value not in VERDICTS:
+            raise ValueError(f"verdict must be one of {list(VERDICTS)}")
+        return value
+
+    @model_validator(mode="after")
+    def _floor(self):
+        """The verdict is never milder than the hazards listed: an uncovered
+        medium or high hazard needs controls, and a high one of a kind in
+        QUALIFIED_KINDS needs a qualified person."""
+        floor = "ok"
+        for h in self.hazards:
+            if h.severity == "high" and h.kind in QUALIFIED_KINDS:
+                floor = max(floor, "qualified-person", key=VERDICTS.index)
+            elif h.severity != "low" and not h.covered:
+                floor = max(floor, "controls-needed", key=VERDICTS.index)
+        self.verdict = max(self.verdict, floor, key=VERDICTS.index)
+        return self
+
+
+class SafetyResult(BaseModel):
+    safety: SafetyReview
+
+
+def safety_input(project: dict, build: dict) -> dict[str, Any]:
+    return {
+        "project": project["name"],
+        "summary": project.get("summary") or "",
+        "climates": project.get("climates") or [],
+        "build_pack": build,
+        "instructions": (
+            "Safety review of this build pack before anyone builds it, for "
+            "Applied Commons' field trials and for the people who will build it "
+            "in homes, farms and villages, often without specialist help. List "
+            "each hazard in building, installing, using or maintaining it: "
+            "electrical (mains, high current, earthing), battery (fire, thermal "
+            "runaway), gas-combustion (leaks, carbon monoxide), pressure, "
+            "heat-fire, structural (collapse, falls, lifting), water-food "
+            "(potable water, food contact, contamination), chemical, mechanical "
+            "(moving parts, cutting), biological-medical (infection, use on "
+            "patients), radio (licensing, exposure). For each: severity (low, "
+            "medium, high), the established standards that govern it (ISO, IEC, "
+            "EN, AS/NZS, or national codes), the controls needed, and whether "
+            "the build pack already covers it (covered). verdict: ok (no "
+            "significant hazard), controls-needed (safe with the listed "
+            "controls), qualified-person (a step needs a licensed or qualified "
+            "person, such as mains wiring, gas fitting, pressure vessels, "
+            "load-bearing structures or medical use) or do-not-build (unsafe "
+            "as designed). Be concrete and brief; do not pad with generic "
+            "advice. " + _COMMON
+        ),
+        "output_format": (
+            '{"summary": "<one paragraph>", "safety": {"verdict": '
+            '"ok|controls-needed|qualified-person|do-not-build", "summary": "", '
+            '"hazards": [{"kind": "electrical|battery|gas-combustion|pressure|'
+            'heat-fire|structural|water-food|chemical|mechanical|'
+            'biological-medical|radio|other", "hazard": "", "severity": '
+            '"low|medium|high", "standards": ["IEC 60364"], "controls": [""], '
+            '"covered": false}]}, "evidence": [{"source_uri": "<url>", '
+            '"title": "", "source_type": ""}]}'
         ),
     }

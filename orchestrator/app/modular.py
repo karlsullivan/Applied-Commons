@@ -38,9 +38,18 @@ VERIFY = "standard-verification"
 MODULES = "module-synthesis"
 SYSTEMS = "system-design"
 ROADMAP = "roadmap-revision"
-JOB_TYPES = (STANDARDS, VERIFY, MODULES, SYSTEMS, ROADMAP)
+REVIEW = "standards-review"
+JOB_TYPES = (STANDARDS, VERIFY, MODULES, SYSTEMS, ROADMAP, REVIEW)
 PRIORITY = 0.88
 VERIFY_PRIORITY = 0.9
+
+#: Keeping approved standards current (policy section 4e): a monthly
+#: standards-review of each against what has been found since, and a
+#: re-verification every REVERIFY_DAYS against current editions of the
+#: established standards.
+REVIEW_PRIORITY = 0.86
+REVERIFY_DAYS = 365
+REVIEW_OUTCOMES = ("keep", "revise", "retire")
 
 #: Verification of a proposed standard (policy section 4e).
 OUTCOMES = ("aligned", "deviates", "no-standard", "unsafe")
@@ -354,10 +363,48 @@ class RoadmapResult(BaseModel):
     roadmap: Roadmap
 
 
+class Conflict(BaseModel):
+    finding: str = Field(min_length=5, max_length=800)
+    source: str = Field(default="", max_length=300)
+
+
+class StandardReview(BaseModel):
+    code: str
+    recommendation: str
+    rationale: str = Field(min_length=10, max_length=2000)
+    conflicts: list[Conflict] = Field(default_factory=list, max_length=10)
+    revision: StandardIn | None = None
+
+    @field_validator("code")
+    @classmethod
+    def _code(cls, value):
+        return slug(value)
+
+    @field_validator("recommendation")
+    @classmethod
+    def _recommendation(cls, value):
+        value = str(value).strip().lower()
+        if value not in REVIEW_OUTCOMES:
+            raise ValueError(f"recommendation must be one of {list(REVIEW_OUTCOMES)}")
+        return value
+
+    @model_validator(mode="after")
+    def _revision_only_when_revising(self):
+        if self.recommendation == "revise" and self.revision is None:
+            raise ValueError("a revise recommendation needs the revised standard")
+        if self.recommendation != "revise":
+            self.revision = None
+        return self
+
+
+class StandardsReviewResult(BaseModel):
+    reviews: list[StandardReview] = Field(min_length=1, max_length=40)
+
+
 def validate(job_type: str, output: dict) -> Any:
     model = {STANDARDS: StandardsResult, VERIFY: VerificationResult,
              MODULES: ModulesResult, SYSTEMS: SystemsResult,
-             ROADMAP: RoadmapResult}[job_type]
+             ROADMAP: RoadmapResult, REVIEW: StandardsReviewResult}[job_type]
     return model(**output)
 
 
@@ -449,7 +496,8 @@ def verification_input(standard: dict) -> dict[str, Any]:
 
 
 def module_input(category: dict, brief: dict | None, projects: list[dict],
-                 standards: list[dict], modules: list[dict]) -> dict[str, Any]:
+                 standards: list[dict], modules: list[dict],
+                 superseded: dict[str, str] | None = None) -> dict[str, Any]:
     return {
         "domain": category["name"],
         **({"track": category["track"]} if category.get("track") else {}),
@@ -457,6 +505,12 @@ def module_input(category: dict, brief: dict | None, projects: list[dict],
         "projects": projects,
         "approved_standards": standards,
         "existing_modules": modules,
+        # A module still on a superseded standard moves to its successor.
+        **({"superseded_standards": superseded,
+            "superseded_note": "existing_modules that use a standard listed in "
+                               "superseded_standards (old code: new code) must be "
+                               "updated to the new standard, keeping their code."}
+           if superseded else {}),
         "scenarios": SCENARIOS,
         "instructions": (
             f"{_SET} For the domain {category['name']}, identify up to 8 "
@@ -564,5 +618,36 @@ def roadmap_input(version: str, systems: list[dict], modules: list[dict],
             '"rationale": "", "season": "", "target_climates": ["cold"], '
             '"cost_eu": null, "cost_low_income": null}]}, "evidence": '
             '[{"source_uri": "<url>", "title": "", "source_type": ""}]}'
+        ),
+    }
+
+
+def standards_review_input(standards: list[dict], projects: list[dict],
+                           modules: list[dict]) -> dict[str, Any]:
+    return {
+        "approved_standards": standards,
+        "projects": projects,
+        "modules": modules,
+        "instructions": (
+            f"{_SET} Review each approved standard below against everything "
+            "found so far: the projects (including findings since it was "
+            "approved) and the modules built on it. adoption gives counts from "
+            "the records; do not recount. List conflicts: findings that "
+            "contradict the standard or show it fits poorly (most comparable "
+            "designs use a different value; a part has become scarce or costly "
+            "where it is needed; modules need workarounds to meet it; a safety "
+            "concern), each with its source (a project name or URL). Recommend "
+            "keep (it still fits), revise (give the revised standard in "
+            "revision, under a new code; it replaces this one once the "
+            "maintainer approves it and is verified first) or retire (no longer "
+            "useful). Change a standard only for a clear reason: every module "
+            "built on it would have to change. " + research._COMMON
+        ),
+        "output_format": (
+            '{"summary": "<one paragraph>", "reviews": [{"code": "<standard code>", '
+            '"recommendation": "keep|revise|retire", "rationale": "", "conflicts": '
+            '[{"finding": "", "source": "<project or url>"}], "revision": '
+            + _STANDARD_FORMAT + ' or null}], "evidence": [{"source_uri": "<url>", '
+            '"title": "", "source_type": ""}]}'
         ),
     }

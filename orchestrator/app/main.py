@@ -32,6 +32,8 @@ DEFAULT_JOB_TYPE_OWNERS = {
     "roadmap-revision": "apollo-hermes",
     "project-relations": "apollo-hermes",
     "need-progress": "apollo-hermes",
+    "standards-review": "apollo-hermes",
+    "safety-review": "apollo-hermes",
     "candidate-assessment": "apollo-hermes",
     "literature-collection": "apollo-hermes",
     "source-summarisation": "apollo-hermes",
@@ -831,7 +833,9 @@ def discover_backlog(item: BacklogDiscover):
     9. relations: a project-relations job over the catalogue each month
        and each time enough new projects have been assessed (section 4f);
     10. progress: a need-progress job per briefed need when what could meet
-       it changes, at most weekly (section 4h).
+       it changes, at most weekly (section 4h);
+    11. safety: a safety-review of each completed build pack, again when
+       it changes (section 4i).
 
     Every job carries a stable unit key, so repeated runs never enqueue the
     same unit twice; completed or failed units are not re-enqueued. Topics
@@ -851,6 +855,7 @@ def discover_backlog(item: BacklogDiscover):
             modular_set = _modular_set(cur, item.limit)
             relations = _relate_projects(cur)
             progress = _track_progress(cur, item.limit)
+            safety = _review_safety(cur, item.limit)
         conn.commit()
     return {
         "steered": steered,
@@ -865,6 +870,7 @@ def discover_backlog(item: BacklogDiscover):
         "modular": modular_set,
         "relations": relations,
         "progress": progress,
+        "safety": safety,
     }
 
 
@@ -1151,6 +1157,59 @@ def _store_progress(cur, job, result, summary: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Build pack safety review (policy section 4i)
+# ---------------------------------------------------------------------------
+
+#: A build pack larger than this goes to the reviewer as a digest.
+SAFETY_MAX_CHARS = 40_000
+
+
+def _review_safety(cur, budget: int) -> list:
+    """A safety-review of each completed build pack, and again whenever
+    any of its sections is rewritten."""
+    cur.execute(
+        """
+        SELECT p.id, p.name, p.summary, p.climates,
+               (SELECT string_agg(b.id::text, ',' ORDER BY b.id) FROM build_packs b
+                WHERE b.project_id = p.id) AS sections
+        FROM projects p WHERE p.status = 'completed' ORDER BY p.id
+        """
+    )
+    created = []
+    for project in cur.fetchall():
+        if len(created) >= budget:
+            break
+        fingerprint = modular.spec_hash(project["sections"] or "")
+        key = f"{research.SAFETY}:{project['id']}:{fingerprint}"
+        if _unit_exists(cur, key):
+            continue
+        cur.execute("SELECT DISTINCT ON (section) section, content FROM build_packs "
+                    "WHERE project_id = %s ORDER BY section, created_at DESC, id DESC",
+                    (project["id"],))
+        build = {r["section"]: r["content"] for r in cur.fetchall()}
+        if len(json.dumps(build, default=str)) > SAFETY_MAX_CHARS:
+            build = {**_build_digest(cur, project["id"]),
+                     **({"test": build["test"]} if "test" in build else {})}
+        job = _enqueue(cur, unit_key=key, job_type=research.SAFETY,
+                       priority=research.SAFETY_PRIORITY, project_id=project["id"],
+                       payload={"fingerprint": fingerprint,
+                                **research.safety_input(project, build)})
+        if job:
+            created.append(job)
+    return created
+
+
+def _store_safety(cur, job, result) -> dict:
+    s = result.safety
+    cur.execute(
+        "INSERT INTO safety_reviews (project_id, verdict, hazards, summary, fingerprint, job_id) "
+        "VALUES (%s, %s, %s, %s, %s, %s)",
+        (job["project_id"], s.verdict, Jsonb([h.model_dump() for h in s.hazards]),
+         s.summary, (job["input"] or {}).get("fingerprint", ""), job["id"]))
+    return {"verdict": s.verdict, "hazards": len(s.hazards)}
+
+
+# ---------------------------------------------------------------------------
 # Stage 2: the modular set (policy section 4e; modular.py)
 # ---------------------------------------------------------------------------
 
@@ -1268,15 +1327,23 @@ def _modular_set(cur, budget: int, month: str | None = None) -> list:
         if job:
             created.append(job)
 
-    cur.execute("SELECT id, code, name, kind, spec, rationale, verified_hash "
-                "FROM standards WHERE status = 'proposed' ORDER BY id")
+    # Proposed standards are verified (again whenever the spec changes);
+    # approved ones again every REVERIFY_DAYS, against current editions.
+    period = int(time.time() // (modular.REVERIFY_DAYS * 86400))
+    cur.execute("SELECT id, code, name, kind, spec, rationale, verified_hash, status, "
+                "(verified_at IS NULL OR verified_at < NOW() - make_interval(days => %s)) "
+                "AS stale FROM standards WHERE status IN ('proposed', 'approved') ORDER BY id",
+                (modular.REVERIFY_DAYS,))
     for standard in cur.fetchall():
         digest = modular.spec_hash(standard["spec"])
-        if standard["verified_hash"] != digest:
+        payload = {"standard_id": standard["id"], "spec_hash": digest,
+                   **modular.verification_input(standard)}
+        if standard["status"] == "proposed" and standard["verified_hash"] != digest:
             enqueue(f"{modular.VERIFY}:{standard['id']}:{digest}", modular.VERIFY,
-                    {"standard_id": standard["id"], "spec_hash": digest,
-                     **modular.verification_input(standard)},
-                    priority=modular.VERIFY_PRIORITY)
+                    payload, priority=modular.VERIFY_PRIORITY)
+        elif standard["status"] == "approved" and standard["stale"]:
+            enqueue(f"{modular.VERIFY}:{standard['id']}:{digest}:{period}", modular.VERIFY,
+                    {**payload, "reverification": True}, priority=modular.VERIFY_PRIORITY)
 
     cur.execute("SELECT count(DISTINCT project_id) AS n FROM assessments")
     if cur.fetchone()["n"] < modular.MIN_ASSESSED_FOR_STANDARDS:
@@ -1287,6 +1354,26 @@ def _modular_set(cur, budget: int, month: str | None = None) -> list:
     standards = _standards_digest(cur)
     if not standards:
         return created  # modules wait for the maintainer's first approvals
+
+    # Monthly fit review of the standards approved at least a week ago.
+    adoption = _adoption(cur)
+    cur.execute("SELECT code, name, kind, spec, decided_at FROM standards "
+                "WHERE status = 'approved' AND decided_at < NOW() - INTERVAL '7 days' "
+                "ORDER BY code")
+    settled = [{"code": r["code"], "name": r["name"], "kind": r["kind"],
+                "spec": _clip(r["spec"], 1200), "approved": str(r["decided_at"])[:10],
+                "adoption": adoption.get(r["code"], {"modules": 0, "systems": 0})}
+               for r in cur.fetchall()]
+    if settled:
+        enqueue(f"{modular.REVIEW}:{month}", modular.REVIEW,
+                {"adoption": {s["code"]: s["adoption"] for s in settled},
+                 **modular.standards_review_input(settled, _projects_digest(cur),
+                                                  _modules_digest(cur))},
+                priority=modular.REVIEW_PRIORITY)
+
+    cur.execute("SELECT supersedes, code FROM standards "
+                "WHERE status = 'approved' AND supersedes IS NOT NULL")
+    superseded = {r["supersedes"]: r["code"] for r in cur.fetchall()}
     for category in _focus_categories(cur):
         cur.execute("SELECT count(DISTINCT a.project_id) AS n FROM assessments a "
                     "JOIN projects p ON p.id = a.project_id WHERE p.category_id = %s",
@@ -1300,7 +1387,7 @@ def _modular_set(cur, budget: int, month: str | None = None) -> list:
             "category_id": category["id"],
             **modular.module_input(category, _latest_brief(cur, category["id"]),
                                    _projects_digest(cur, category["id"], 25, detail=True),
-                                   standards, _modules_digest(cur))})
+                                   standards, _modules_digest(cur), superseded)})
 
     if _wave_pending(cur, modular.MODULES, month):
         return created
@@ -1355,21 +1442,43 @@ def _briefs_digest(cur) -> list[dict]:
             for r in cur.fetchall()]
 
 
-def _upsert_standard(cur, job_id, s) -> str:
+def _adoption(cur) -> dict[str, dict]:
+    """Per standard code: the modules that use it and the systems built
+    from those modules, counted from the records."""
+    cur.execute("SELECT code, standards FROM modules")
+    uses = {r["code"]: set(r["standards"]) for r in cur.fetchall()}
+    out: dict[str, dict] = {}
+    for module, codes in uses.items():
+        for code in codes:
+            out.setdefault(code, {"modules": [], "systems": set()})["modules"].append(module)
+    cur.execute("SELECT code, modules FROM systems")
+    for system in cur.fetchall():
+        for m in system["modules"]:
+            for code in uses.get(m.get("module"), ()):
+                out[code]["systems"].add(system["code"])
+    return {code: {"modules": len(a["modules"]), "module_codes": sorted(a["modules"])[:20],
+                   "systems": len(a["systems"])} for code, a in out.items()}
+
+
+def _upsert_standard(cur, job_id, s, supersedes: str | None = None) -> str:
     """Insert a proposed standard, or refresh one still proposed; a
-    decided standard (approved or rejected) is never overwritten."""
+    decided standard (approved, rejected or superseded) is never
+    overwritten. ``supersedes`` names the approved standard a revision
+    would replace."""
     cur.execute(
         """
-        INSERT INTO standards (code, name, kind, spec, rationale, used_by, job_id)
-        VALUES (%s, %s, %s, %s, %s, %s, %s)
+        INSERT INTO standards (code, name, kind, spec, rationale, used_by, job_id, supersedes)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
         ON CONFLICT (code) DO UPDATE SET
             name = EXCLUDED.name, kind = EXCLUDED.kind, spec = EXCLUDED.spec,
             rationale = EXCLUDED.rationale, used_by = EXCLUDED.used_by,
-            job_id = EXCLUDED.job_id, updated_at = NOW()
+            job_id = EXCLUDED.job_id,
+            supersedes = COALESCE(EXCLUDED.supersedes, standards.supersedes),
+            updated_at = NOW()
         WHERE standards.status = 'proposed'
         RETURNING status
         """,
-        (s.code, s.name, s.kind, s.spec, s.rationale, Jsonb(s.used_by), job_id),
+        (s.code, s.name, s.kind, s.spec, s.rationale, Jsonb(s.used_by), job_id, supersedes),
     )
     row = cur.fetchone()
     return row["status"] if row else "kept"
@@ -1379,10 +1488,11 @@ def _store_modular(cur, job, result) -> dict:
     job_type, job_id, inp = job["job_type"], job["id"], job["input"] or {}
     if job_type == modular.VERIFY:
         # Recorded against the spec that was verified; a spec changed since
-        # stays unverified and gets a new verification.
+        # stays unverified and gets a new verification. An approved
+        # standard's yearly re-verification is recorded the same way.
         cur.execute(
             "UPDATE standards SET verification = %s, verified_hash = %s, verified_at = NOW() "
-            "WHERE id = %s AND status = 'proposed' RETURNING id",
+            "WHERE id = %s AND status IN ('proposed', 'approved') RETURNING id",
             (Jsonb(result.verification.model_dump()), inp.get("spec_hash"),
              inp.get("standard_id")),
         )
@@ -1392,6 +1502,35 @@ def _store_modular(cur, job, result) -> dict:
     if job_type == modular.STANDARDS:
         statuses = [_upsert_standard(cur, job_id, s) for s in result.standards]
         return {"standards": len(statuses)}
+
+    if job_type == modular.REVIEW:
+        # Each approved standard's fit; a revision becomes a proposal that
+        # supersedes it once approved (after its own verification).
+        adoption = inp.get("adoption") or {}
+        month = (job.get("unit_key") or "").rsplit(":", 1)[-1] or modular.month()
+        stored = revisions = 0
+        for review in result.reviews:
+            cur.execute("SELECT id FROM standards WHERE code = %s AND status = 'approved'",
+                        (review.code,))
+            row = cur.fetchone()
+            if row is None:
+                continue
+            revision = None
+            if review.revision is not None:
+                rev = review.revision
+                if rev.code == review.code:
+                    rev = rev.model_copy(update={"code": modular.slug(f"{rev.code}-rev-{month}")})
+                if _upsert_standard(cur, job_id, rev, supersedes=review.code) != "kept":
+                    revision, revisions = rev.code, revisions + 1
+            cur.execute(
+                "INSERT INTO standard_reviews (standard_id, month, adoption, conflicts, "
+                "recommendation, rationale, revision, job_id) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+                (row["id"], month, Jsonb(adoption.get(review.code) or {}),
+                 Jsonb([c.model_dump() for c in review.conflicts]), review.recommendation,
+                 review.rationale, revision, job_id))
+            stored += 1
+        return {"reviews": stored, "revisions": revisions}
 
     if job_type == modular.MODULES:
         cur.execute("SELECT id, lower(name) AS name FROM projects WHERE category_id = %s",
@@ -1537,6 +1676,8 @@ def catalogue():
                        sc.licence, COALESCE(sc.licence_class, 'unchecked') AS licence_class,
                        sc.last_activity, sc.archived AS repository_archived,
                        sc.checked_at AS sources_checked_at,
+                       (SELECT verdict FROM safety_reviews WHERE project_id = p.id
+                        ORDER BY created_at DESC, id DESC LIMIT 1) AS safety,
                        (SELECT count(*) FROM jsonb_array_elements(sc.links) l
                         WHERE l->>'state' IN ('broken', 'unreachable')) AS broken_links
                 FROM projects p LEFT JOIN need_categories c ON c.id = p.category_id
@@ -1634,22 +1775,40 @@ def project_record(project_id: int):
                     "SELECT links, licence, licence_class, licence_source, repository, "
                     "last_activity, archived, checked_at FROM source_checks "
                     "WHERE project_id = %s ORDER BY checked_at DESC, id DESC LIMIT 1")), None),
+                "safety": next(iter(rows(
+                    "SELECT verdict, hazards, summary, created_at FROM safety_reviews "
+                    "WHERE project_id = %s ORDER BY created_at DESC, id DESC LIMIT 1")), None),
             }
 
 
 @app.get("/standards")
 def get_standards():
     """Interface standards, proposed and decided (section 4e), with their
-    verification; ``verified`` means the current spec was verified."""
+    verification (``verified``: the current spec was verified), what they
+    supersede or are superseded by, their adoption counted from the
+    records, and the latest fit review."""
     with db() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT id, code, name, kind, spec, rationale, used_by, status, "
-                        "decision_note, decided_at, verification, verified_hash, "
-                        "verified_at, created_at, updated_at "
-                        "FROM standards ORDER BY kind, code")
+            cur.execute(
+                """
+                SELECT s.id, s.code, s.name, s.kind, s.spec, s.rationale, s.used_by,
+                       s.status, s.decision_note, s.decided_at, s.verification,
+                       s.verified_hash, s.verified_at, s.created_at, s.updated_at,
+                       s.supersedes,
+                       (SELECT n.code FROM standards n WHERE n.supersedes = s.code
+                        AND n.status <> 'rejected' ORDER BY n.id DESC LIMIT 1) AS superseded_by,
+                       (SELECT to_jsonb(r) - 'standard_id' - 'job_id' FROM standard_reviews r
+                        WHERE r.standard_id = s.id
+                        ORDER BY r.created_at DESC, r.id DESC LIMIT 1) AS review
+                FROM standards s ORDER BY s.kind, s.code
+                """
+            )
             rows = cur.fetchall()
+            adoption = _adoption(cur)
     for row in rows:
         row["verified"] = row.pop("verified_hash") == modular.spec_hash(row["spec"])
+        row["adoption"] = adoption.get(row["code"], {"modules": 0, "module_codes": [],
+                                                     "systems": 0})
     return rows
 
 
@@ -1676,7 +1835,9 @@ def _decide_on(table: str, item_id: int, item: Decision) -> dict:
 def decide_standard(standard_id: int, item: Decision):
     """The maintainer approves or rejects a proposed standard; modules are
     specified only against approved ones. Approval needs a verification of
-    the current spec (standard-verification); rejection does not."""
+    the current spec (standard-verification); rejection does not.
+    Approving a revision supersedes the standard it replaces; rejecting an
+    approved standard retires it."""
     if item.decision == "approved":
         with db() as conn:
             with conn.cursor() as cur:
@@ -1688,7 +1849,16 @@ def decide_standard(standard_id: int, item: Decision):
         if row["verified_hash"] != modular.spec_hash(row["spec"]):
             raise HTTPException(status_code=409,
                                 detail="not verified yet: approve after its verification")
-    return _decide_on("standards", standard_id, item)
+    result = _decide_on("standards", standard_id, item)
+    if item.decision == "approved":
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE standards SET status = 'superseded', decided_at = NOW() "
+                    "WHERE status = 'approved' AND code = (SELECT supersedes FROM standards "
+                    "WHERE id = %s)", (standard_id,))
+            conn.commit()
+    return result
 
 
 @app.get("/modules")
@@ -2185,6 +2355,8 @@ def complete_job(job_id: int, item: JobComplete):
                      if job_type == research.RELATIONS else None)
         progress = (research.ProgressResult(**item.output)
                     if job_type == research.PROGRESS else None)
+        safety = (research.SafetyResult(**item.output)
+                  if job_type == research.SAFETY else None)
         if assessment is not None:
             # Only an enabler lists the needs it serves (section 2a).
             assessment.serves = list(dict.fromkeys(
@@ -2282,6 +2454,8 @@ def complete_job(job_id: int, item: JobComplete):
                 elif progress is not None:
                     extra = _store_progress(cur, result, progress,
                                             str(item.output.get("summary") or ""))
+                elif safety is not None:
+                    extra = _store_safety(cur, result, safety)
                 elif job_type == research.LITERATURE and result["question_id"]:
                     cur.execute(
                         "UPDATE questions SET status = 'answered' "
