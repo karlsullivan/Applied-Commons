@@ -1,0 +1,15 @@
+[Unit]
+Description=Applied Commons backup (database dump and site profiles; off-site copy when configured)
+Documentation=file:///srv/orchestrator/tenants/applied-commons/workspaces/Applied-Commons/orchestrator/ops/backup/backup-applied-commons.sh
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+# Root: it needs docker (the orchestrator account has none since 2026-10-06).
+EnvironmentFile=-/etc/applied-commons/backup.env
+EnvironmentFile=-/etc/apollo/alerts.env
+ExecStart=/bin/bash /srv/orchestrator/tenants/applied-commons/workspaces/Applied-Commons/orchestrator/ops/backup/backup-applied-commons.sh
+TimeoutStartSec=2h
+Nice=10
+IOSchedulingClass=idle

@@ -1,0 +1,10 @@
+[Unit]
+Description=Applied Commons backup, nightly
+
+[Timer]
+OnCalendar=*-*-* 02:00:00
+Persistent=true
+RandomizedDelaySec=10m
+
+[Install]
+WantedBy=timers.target
