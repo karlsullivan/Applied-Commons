@@ -41,8 +41,10 @@ def client():
 def clean(client):
     with psycopg.connect(DB_URL) as conn:
         conn.execute(
-            "TRUNCATE jobs, findings, evidence, questions, projects, sites RESTART IDENTITY CASCADE"
+            "TRUNCATE jobs, findings, evidence, questions, projects, sites, modules, "
+            "systems, standards, roadmaps RESTART IDENTITY CASCADE"
         )
+        conn.execute("UPDATE need_categories SET solved_at = NULL, solved_note = NULL")
     yield
 
 
@@ -1282,3 +1284,97 @@ def test_invalid_checks_are_refused(client, body):
     assert client.post(f"/projects/{pid}/check", json=body).status_code == 422
     assert client.post("/projects/999999/check",
                        json={"licence_class": "open"}).status_code == 404
+
+
+def water_progress_setup():
+    """Water briefed, two screened projects: one with a complete build pack
+    and an open licence, one without."""
+    from psycopg.types.json import Jsonb
+
+    cid = screened(2)
+    sql("INSERT INTO need_briefs (category_id, brief) VALUES (%s, %s)", cid, Jsonb(BRIEF))
+    sql("UPDATE projects SET status = 'completed' WHERE code = 'p-water-0'")
+    [(pid,)] = sql("SELECT id FROM projects WHERE code = 'p-water-0'")
+    sql("INSERT INTO source_checks (project_id, licence, licence_class) VALUES (%s, 'MIT', 'open')",
+        pid)
+    return cid
+
+
+def progress_out(*items):
+    return {"summary": "Close on filtration, far on volume.", "progress": list(items)}
+
+
+def test_progress_is_tracked_when_what_meets_a_need_changes(client):
+    cid = water_progress_setup()
+    [job] = discover(client)["progress"]
+    assert job["unit_key"].startswith(f"need-progress:{cid}:")
+    [(payload,)] = sql("SELECT input FROM jobs WHERE job_type = 'need-progress'")
+    assert [r["text"] for r in payload["requirements"]] == BRIEF["requirements"]
+    complete_project = next(p for p in payload["projects"] if p["code"] == "p-water-0")
+    assert complete_project["build_pack_complete"] and complete_project["licence_class"] == "open"
+    assert discover(client)["progress"] == []  # unchanged
+    sql("UPDATE jobs SET status = 'completed' WHERE job_type = 'need-progress'")
+    screened(1, prefix="Q")  # changed, but within the week
+    assert discover(client)["progress"] == []
+    sql("UPDATE jobs SET created_at = NOW() - INTERVAL '8 days' WHERE job_type = 'need-progress'")
+    assert len(discover(client)["progress"]) == 1
+
+
+def test_progress_levels_are_capped_by_the_records(client):
+    cid = water_progress_setup()
+    discover(client)
+    _, r = run_job(client, "need-progress", progress_out(
+        {"requirement": 1, "level": "field-tested",
+         "met_by": [{"code": "p-water-0", "how": "Lab test shows 99.9%."}]},
+        {"requirement": 2, "level": "documented",
+         "met_by": [{"code": "p-water-1", "how": "Claims 20 L/day."},
+                    {"code": "made-up", "how": "?"}]},
+        {"requirement": 9, "level": "designed", "met_by": []}))
+    assert r.status_code == 200, r.text
+    assert r.json()["requirements"] == 2 and r.json()["lowered"] == 2
+    water = next(c for c in client.get("/categories").json() if c["id"] == cid)
+    first, second = water["progress"]
+    assert (first["level"], first["claimed"]) == ("documented", "field-tested")
+    assert (second["level"], [m["code"] for m in second["met_by"]]) == ("candidate", ["p-water-1"])
+    assert water["status"] == "candidates found"
+    assert water["progress_summary"].startswith("Close on filtration")
+    others = [c for c in client.get("/categories").json() if c["id"] != cid]
+    assert {c["status"] for c in others} == {"researching"}
+
+
+def test_only_the_maintainer_marks_a_need_solved_and_only_once_field_tested(client):
+    from psycopg.types.json import Jsonb
+
+    cid = water_progress_setup()
+    discover(client)
+    run_job(client, "need-progress", progress_out(
+        {"requirement": 1, "level": "documented", "met_by": [{"code": "p-water-0"}]},
+        {"requirement": 2, "level": "none"}))
+    r = client.post(f"/categories/{cid}/solved", json={"solved": True})
+    assert r.status_code == 409 and "field-tested" in r.json()["detail"]
+    sql("INSERT INTO modules (code, name, kind, domain, maturity, spec) "
+        "VALUES ('solar-filter', 'Solar filter', 'hardware', 'Water', 'tested', %s)",
+        Jsonb({"purpose": "Filters water.", "domains": ["Water"]}))
+    sql("UPDATE jobs SET created_at = NOW() - INTERVAL '8 days' WHERE job_type = 'need-progress'")
+    discover(client)
+    run_job(client, "need-progress", progress_out(
+        {"requirement": 1, "level": "field-tested", "met_by": [{"code": "solar-filter"}]},
+        {"requirement": 2, "level": "field-tested", "met_by": [{"code": "solar-filter"}]}))
+    water = next(c for c in client.get("/categories").json() if c["id"] == cid)
+    assert water["status"] == "field-tested"
+    assert client.post(f"/categories/{cid}/solved",
+                       json={"solved": True, "note": "Works all winter."}).status_code == 200
+    water = next(c for c in client.get("/categories").json() if c["id"] == cid)
+    assert water["status"] == "substantially solved" and water["solved_note"] == "Works all winter."
+    client.post(f"/categories/{cid}/solved", json={"solved": False})
+    water = next(c for c in client.get("/categories").json() if c["id"] == cid)
+    assert water["status"] == "field-tested" and water["solved_at"] is None
+
+
+def test_invalid_progress_writes_nothing(client):
+    water_progress_setup()
+    discover(client)
+    job, r = run_job(client, "need-progress", progress_out(
+        {"requirement": 1, "level": "nearly", "met_by": []}))
+    assert r.status_code == 422
+    assert sql("SELECT count(*) FROM need_progress") == [(0,)]

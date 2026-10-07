@@ -40,6 +40,21 @@ RELATIONS_STEP = 25
 RELATIONS_PRIORITY = 0.7
 RELATIONS_MAX_PROJECTS = 200
 
+#: Progress towards done per need (policy section 4h): each brief
+#: requirement at one of these levels, lowest first. A need-progress job
+#: runs when what could meet a need changes, at most every
+#: PROGRESS_MIN_DAYS days per need.
+PROGRESS = "need-progress"
+LEVELS = ("none", "candidate", "documented", "designed", "field-tested")
+PROGRESS_PRIORITY = 0.6
+PROGRESS_MIN_DAYS = 7
+#: A need's status from its weakest requirement; "substantially solved"
+#: is set only by the maintainer.
+STATUS = {"none": "researching", "candidate": "candidates found",
+          "documented": "documented", "designed": "designed",
+          "field-tested": "field-tested"}
+SOLVED = "substantially solved"
+
 #: A category's need brief is refreshed after this many days.
 BRIEF_REFRESH_DAYS = 90
 
@@ -842,5 +857,69 @@ def relations_input(projects: list[dict], existing: list[dict]) -> dict[str, Any
             '{"summary": "<one paragraph>", "relations": [{"a": "<project code>", '
             '"b": "<project code>", "kind": "uses|enables|alternative|part-of", '
             '"why": ""}], "evidence": []}'
+        ),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Progress towards done per need (policy section 4h)
+# ---------------------------------------------------------------------------
+
+
+class MetBy(BaseModel):
+    code: str = Field(min_length=1, max_length=120)
+    how: str = Field(default="", max_length=500)
+
+
+class RequirementProgress(BaseModel):
+    requirement: int = Field(ge=1, le=10)
+    level: str
+    met_by: list[MetBy] = Field(default_factory=list, max_length=10)
+    gap: str = Field(default="", max_length=800)
+
+    @field_validator("level")
+    @classmethod
+    def _level(cls, value):
+        value = str(value).strip().lower().replace(" ", "-")
+        if value not in LEVELS:
+            raise ValueError(f"level must be one of {', '.join(LEVELS)}")
+        return value
+
+
+class ProgressResult(BaseModel):
+    progress: list[RequirementProgress] = Field(min_length=1, max_length=10)
+
+
+def progress_input(category: dict, requirements: list[str], projects: list[dict],
+                   modules: list[dict], systems: list[dict]) -> dict[str, Any]:
+    return {
+        "category": category["name"],
+        "requirements": [{"requirement": n, "text": text}
+                         for n, text in enumerate(requirements, 1)],
+        "projects": projects,
+        "modules": modules,
+        "systems": systems,
+        "instructions": (
+            "Applied Commons tracks how close each human need is to being "
+            "solved by open, buildable solutions. For each numbered requirement "
+            f"of the need '{category['name']}', say which of the projects, "
+            "modules and systems below meet it (by code) and how, and what gap "
+            "remains. Levels: none (nothing below meets it); candidate (a "
+            "project claims to meet it); documented (a project with a complete "
+            "build pack under an open or share-alike licence meets it); "
+            "designed (a module or system of Applied Commons' modular set "
+            "meets it); field-tested (a module tested in the real world meets "
+            "it). Give the highest level the evidence below supports; the "
+            "orchestrator lowers any level the records do not bear out. Judge "
+            "each requirement on its own wording, strictly: a project that "
+            "helps but does not meet the stated figure does not meet it. Work "
+            "only from the material below."
+        ),
+        "output_format": (
+            '{"summary": "<one paragraph: how close the need is to solved and '
+            'the biggest gaps>", "progress": [{"requirement": 1, "level": '
+            '"none|candidate|documented|designed|field-tested", "met_by": '
+            '[{"code": "<project, module or system code>", "how": ""}], "gap": ""}], '
+            '"evidence": []}'
         ),
     }

@@ -219,6 +219,10 @@ A project-relations job relates catalogue projects to each other, so that a read
 
 Every project's sources are checked automatically, without a model (ops/checks/check_sources.py), when first catalogued and every 14 days after: whether its links answer (ok, broken, blocked by the site, unreachable), its licence, and whether its repository is maintained or archived. The licence comes from the GitHub or GitLab API where the project has a repository there (verified); otherwise from what its build pack reported (unverified). Each project is classed open, share-alike, restricted (non-commercial or no-derivatives), none (a repository without a licence, so all rights reserved) or unknown (an unrecognised licence or nothing to check). Modules build only on open and share-alike projects (section 9); a project classed none or unknown may still be catalogued and researched, and its authors can be asked to add a licence.
 
+4h. Progress towards done
+
+A need is done when modules tested in the real world substantially solve it (section 9). Progress is tracked against the requirements in its brief. A need-progress job matches each requirement to the projects, modules and systems that meet it, at one of five levels: none; candidate (a screened project claims it); documented (a project with a complete build pack under an open or share-alike licence meets it); designed (a module or system of the modular set meets it); field-tested (a module tested in the real world meets it). The orchestrator lowers any level the records do not support, so a model cannot overstate progress. A need's status is its weakest requirement's level. Only the maintainer marks a need substantially solved, and only once at least one requirement is field-tested; continuous improvement (stage 4) then closes the remaining gaps. The job runs when what could meet a need changes, at most weekly per need.
+
 5. Focus and project limits
 
 The portfolio runs projects in parallel, limited by available compute (section 9):

@@ -1,3 +1,4 @@
+import json
 import os
 import time
 from datetime import datetime
@@ -30,6 +31,7 @@ DEFAULT_JOB_TYPE_OWNERS = {
     "system-design": "apollo-hermes",
     "roadmap-revision": "apollo-hermes",
     "project-relations": "apollo-hermes",
+    "need-progress": "apollo-hermes",
     "candidate-assessment": "apollo-hermes",
     "literature-collection": "apollo-hermes",
     "source-summarisation": "apollo-hermes",
@@ -137,6 +139,12 @@ class BacklogDiscover(BaseModel):
 
 class ProjectSteer(BaseModel):
     steer: str | None = Field(default=None, pattern="^(build|park)$")
+    note: str = Field(default="", max_length=2000)
+
+
+class Solved(BaseModel):
+    """The maintainer's judgement that a need is substantially solved."""
+    solved: bool
     note: str = Field(default="", max_length=2000)
 
 
@@ -821,7 +829,9 @@ def discover_backlog(item: BacklogDiscover):
        design per scenario after the month's modules; the roadmap after the
        month's systems;
     9. relations: a project-relations job over the catalogue each month
-       and each time enough new projects have been assessed (section 4f).
+       and each time enough new projects have been assessed (section 4f);
+    10. progress: a need-progress job per briefed need when what could meet
+       it changes, at most weekly (section 4h).
 
     Every job carries a stable unit key, so repeated runs never enqueue the
     same unit twice; completed or failed units are not re-enqueued. Topics
@@ -840,6 +850,7 @@ def discover_backlog(item: BacklogDiscover):
             completed = _complete_builds(cur)
             modular_set = _modular_set(cur, item.limit)
             relations = _relate_projects(cur)
+            progress = _track_progress(cur, item.limit)
         conn.commit()
     return {
         "steered": steered,
@@ -853,6 +864,7 @@ def discover_backlog(item: BacklogDiscover):
         "completed": completed,
         "modular": modular_set,
         "relations": relations,
+        "progress": progress,
     }
 
 
@@ -940,27 +952,202 @@ def relations():
             return cur.fetchall()
 
 
+def _need_status(solved_at, requirements) -> str:
+    """A need's status: the maintainer's mark, else its weakest requirement."""
+    if solved_at:
+        return research.SOLVED
+    levels = [r.get("level") for r in requirements or [] if r.get("level") in research.LEVELS]
+    if not levels:
+        return research.STATUS["none"]
+    return research.STATUS[min(levels, key=research.LEVELS.index)]
+
+
 @app.get("/categories")
 def categories():
     """Every need category, briefed or not, with its latest brief (or
-    null) and whether discovery covers it (``focus``): the wiki's
-    browse tree."""
+    null), whether discovery covers it (``focus``), and its progress
+    towards done (section 4h): the latest requirement levels, ``status``
+    and the maintainer's ``solved_at``. The wiki's browse tree."""
     with db() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 """
                 SELECT c.id, c.layer, c.name, c.scope, COALESCE(c.track, 'need') AS track,
                        COALESCE(c.layer = ANY(%s) OR c.track = %s, FALSE) AS focus,
-                       b.brief, b.created_at AS brief_at
+                       b.brief, b.created_at AS brief_at, c.solved_at, c.solved_note,
+                       g.requirements AS progress, g.summary AS progress_summary,
+                       g.created_at AS progress_at
                 FROM need_categories c
                 LEFT JOIN LATERAL (
                     SELECT brief, created_at FROM need_briefs WHERE category_id = c.id
                     ORDER BY created_at DESC, id DESC LIMIT 1) b ON TRUE
+                LEFT JOIN LATERAL (
+                    SELECT requirements, summary, created_at FROM need_progress
+                    WHERE category_id = c.id ORDER BY created_at DESC, id DESC LIMIT 1) g ON TRUE
                 ORDER BY (COALESCE(c.track, 'need') = %s), c.layer NULLS LAST, c.name
                 """,
                 (list(research.DISCOVERY_LAYERS), research.ENABLER, research.ENABLER),
             )
-            return cur.fetchall()
+            rows = cur.fetchall()
+    for row in rows:
+        row["status"] = _need_status(row["solved_at"], row["progress"])
+    return rows
+
+
+@app.post("/categories/{category_id}/solved")
+def mark_solved(category_id: int, item: Solved):
+    """The maintainer marks a need substantially solved (or not). Marking
+    needs at least one requirement met by a module tested in the real
+    world (section 4h)."""
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1 FROM need_categories WHERE id = %s", (category_id,))
+            if cur.fetchone() is None:
+                raise HTTPException(status_code=404, detail="no such category")
+            if item.solved:
+                cur.execute("SELECT requirements FROM need_progress WHERE category_id = %s "
+                            "ORDER BY created_at DESC, id DESC LIMIT 1", (category_id,))
+                row = cur.fetchone()
+                if not row or not any(r.get("level") == "field-tested"
+                                      for r in row["requirements"]):
+                    raise HTTPException(status_code=409, detail=(
+                        "nothing field-tested yet: a need is done when modules tested "
+                        "in the real world substantially solve it"))
+            cur.execute(
+                "UPDATE need_categories SET solved_at = CASE WHEN %s THEN NOW() END, "
+                "solved_note = %s WHERE id = %s RETURNING id, solved_at",
+                (item.solved, item.note or None, category_id))
+            result = cur.fetchone()
+        conn.commit()
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Progress towards done per need (policy section 4h)
+# ---------------------------------------------------------------------------
+
+
+def _progress_facts(cur, category) -> tuple[list, list, list]:
+    """What could meet a need: its screened projects and the enablers
+    serving it, the modules of its domain, and the systems using them."""
+    cur.execute(
+        f"""
+        SELECT p.id, p.code, p.name, p.status, {_STAGE_SQL} AS stage, p.summary,
+               COALESCE(sc.licence_class, 'unchecked') AS licence_class,
+               (SELECT r.fit FROM reviews r WHERE r.project_id = p.id
+                ORDER BY r.id DESC LIMIT 1) AS fit
+        FROM projects p
+        LEFT JOIN LATERAL (SELECT licence_class FROM source_checks WHERE project_id = p.id
+                           ORDER BY checked_at DESC, id DESC LIMIT 1) sc ON TRUE
+        WHERE (p.category_id = %s OR p.serves ? %s)
+          AND EXISTS (SELECT 1 FROM assessments a WHERE a.project_id = p.id)
+        ORDER BY p.score DESC NULLS LAST, p.id LIMIT 60
+        """,
+        (category["id"], category["name"]),
+    )
+    projects = [{"code": r["code"], "name": r["name"], "stage": r["stage"],
+                 "build_pack_complete": r["status"] == "completed",
+                 "licence_class": r["licence_class"], "summary": _clip(r["summary"], 300),
+                 **({"fit": _clip(r["fit"], 400)} if r["fit"] else {})}
+                for r in cur.fetchall()]
+    cur.execute("SELECT code, name, maturity, spec FROM modules "
+                "WHERE domain = %s OR spec->'domains' ? %s ORDER BY code",
+                (category["name"], category["name"]))
+    modules = [{"code": r["code"], "name": r["name"], "maturity": r["maturity"],
+                "purpose": _clip(r["spec"].get("purpose"), 300)} for r in cur.fetchall()]
+    codes = {m["code"] for m in modules}
+    cur.execute("SELECT code, name, scenario, modules, spec FROM systems ORDER BY code")
+    systems = [{"code": r["code"], "name": r["name"], "scenario": r["scenario"],
+                "purpose": _clip(r["spec"].get("purpose"), 300)}
+               for r in cur.fetchall()
+               if codes & {m.get("module") for m in r["modules"]}]
+    return projects, modules, systems
+
+
+def _track_progress(cur, budget: int) -> list:
+    """A need-progress job per briefed focus need when what could meet it
+    has changed, at most every PROGRESS_MIN_DAYS days per need."""
+    created = []
+    for category in _focus_categories(cur):
+        if len(created) >= budget:
+            break
+        cur.execute("SELECT id, brief FROM need_briefs WHERE category_id = %s "
+                    "ORDER BY created_at DESC, id DESC LIMIT 1", (category["id"],))
+        brief = cur.fetchone()
+        if not brief:
+            continue
+        projects, modules, systems = _progress_facts(cur, category)
+        if not projects:
+            continue
+        fingerprint = modular.spec_hash(json.dumps(
+            [brief["id"], [(p["code"], p["stage"], p["licence_class"]) for p in projects],
+             [(m["code"], m["maturity"]) for m in modules], [s["code"] for s in systems]],
+            sort_keys=True))
+        key = f"{research.PROGRESS}:{category['id']}:{fingerprint}"
+        if _unit_exists(cur, key):
+            continue
+        cur.execute("SELECT 1 FROM jobs WHERE job_type = %s AND input->>'category_id' = %s "
+                    "AND created_at > NOW() - make_interval(days => %s) LIMIT 1",
+                    (research.PROGRESS, str(category["id"]), research.PROGRESS_MIN_DAYS))
+        if cur.fetchone():
+            continue
+        job = _enqueue(cur, unit_key=key, job_type=research.PROGRESS,
+                       priority=research.PROGRESS_PRIORITY,
+                       payload={"category_id": category["id"],
+                                **research.progress_input(category,
+                                                          brief["brief"].get("requirements") or [],
+                                                          projects, modules, systems)})
+        if job:
+            created.append(job)
+    return created
+
+
+def _level_cap(kind: str, fact: dict) -> str:
+    """The highest level the records support for one reference."""
+    if kind == "module":
+        return "field-tested" if fact["maturity"] == "tested" else "designed"
+    if kind == "system":
+        return "designed"
+    if fact["status"] == "completed" and fact["licence_class"] in ("open", "share-alike"):
+        return "documented"
+    return "candidate"
+
+
+def _store_progress(cur, job, result, summary: str) -> dict:
+    """Record a need's requirement levels, each lowered to what the
+    records support; references to unknown codes are dropped."""
+    inp = job["input"] or {}
+    texts = {r["requirement"]: r["text"] for r in inp.get("requirements") or []}
+    cur.execute(
+        """
+        SELECT p.code, p.status, COALESCE(sc.licence_class, 'unchecked') AS licence_class
+        FROM projects p
+        LEFT JOIN LATERAL (SELECT licence_class FROM source_checks WHERE project_id = p.id
+                           ORDER BY checked_at DESC, id DESC LIMIT 1) sc ON TRUE
+        """
+    )
+    facts = {r["code"]: ("project", r) for r in cur.fetchall()}
+    cur.execute("SELECT code, maturity FROM modules")
+    facts.update({r["code"]: ("module", r) for r in cur.fetchall()})
+    cur.execute("SELECT code FROM systems")
+    facts.update({r["code"]: ("system", r) for r in cur.fetchall()})
+    order = research.LEVELS.index
+    out, lowered = [], 0
+    for item in result.progress:
+        if item.requirement not in texts:
+            continue
+        met_by = [{"code": m.code, "kind": facts[m.code][0], "how": m.how}
+                  for m in item.met_by if m.code in facts]
+        cap = max((_level_cap(*facts[m["code"]]) for m in met_by), key=order, default="none")
+        level = min(item.level, cap, key=order)
+        lowered += level != item.level
+        out.append({"requirement": item.requirement, "text": texts[item.requirement],
+                    "level": level, "claimed": item.level, "met_by": met_by, "gap": item.gap})
+    out.sort(key=lambda r: r["requirement"])
+    cur.execute("INSERT INTO need_progress (category_id, requirements, summary, job_id) "
+                "VALUES (%s, %s, %s, %s)",
+                (inp["category_id"], Jsonb(out), _clip(summary, 3000), job["id"]))
+    return {"requirements": len(out), "lowered": lowered}
 
 
 # ---------------------------------------------------------------------------
@@ -1996,6 +2183,8 @@ def complete_job(job_id: int, item: JobComplete):
                   if job_type in modular.JOB_TYPES else None)
         relations = (research.RelationsResult(**item.output)
                      if job_type == research.RELATIONS else None)
+        progress = (research.ProgressResult(**item.output)
+                    if job_type == research.PROGRESS else None)
         if assessment is not None:
             # Only an enabler lists the needs it serves (section 2a).
             assessment.serves = list(dict.fromkeys(
@@ -2090,6 +2279,9 @@ def complete_job(job_id: int, item: JobComplete):
                     extra = _store_modular(cur, result, stage2)
                 elif relations is not None:
                     extra = _store_relations(cur, result, relations)
+                elif progress is not None:
+                    extra = _store_progress(cur, result, progress,
+                                            str(item.output.get("summary") or ""))
                 elif job_type == research.LITERATURE and result["question_id"]:
                     cur.execute(
                         "UPDATE questions SET status = 'answered' "
