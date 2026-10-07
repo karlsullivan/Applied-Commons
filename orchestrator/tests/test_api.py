@@ -41,7 +41,7 @@ def client():
 def clean(client):
     with psycopg.connect(DB_URL) as conn:
         conn.execute(
-            "TRUNCATE jobs, findings, evidence, questions, projects RESTART IDENTITY CASCADE"
+            "TRUNCATE jobs, findings, evidence, questions, projects, sites RESTART IDENTITY CASCADE"
         )
     yield
 
@@ -864,3 +864,207 @@ def test_screening_records_climates(client):
     output["assessment"]["climates"] = ["polar", "tropical"]
     complete(client, job, output)
     assert sql("SELECT climates FROM projects") == [(["tropical", "polar"],)]
+
+
+# ---------------------------------------------------------------------------
+# Stage 2: the modular set (policy section 4e)
+# ---------------------------------------------------------------------------
+
+
+def screened(n, category="Water", prefix="P"):
+    """n assessed projects in a category, inserted directly."""
+    from psycopg.types.json import Jsonb
+
+    [(cid,)] = sql("SELECT id FROM need_categories WHERE name = %s", category)
+    for i in range(n):
+        [(pid,)] = sql(
+            "INSERT INTO projects (code, name, maslow_level, domain, status, category_id, "
+            "summary, score) VALUES (%s, %s, 1, %s, 'candidate', %s, 'An open design.', 0.6) "
+            "RETURNING id", f"{prefix.lower()}-{category[:5].lower()}-{i}",
+            f"{prefix} {category} {i}", category, cid)
+        sql("INSERT INTO assessments (project_id, rubric_version, scores, composite, "
+            "requirements, rationale) VALUES (%s, 'rubric-v1', %s, 0.6, %s, 'ok')",
+            pid, Jsonb({"evidence": 0.5}), Jsonb({}))
+    return cid
+
+
+STANDARD = {"code": "DC Bus 24V", "name": "24 V DC bus", "kind": "Electrical",
+            "spec": "24 V nominal DC, XT60 connectors, 20 A fuse per branch.",
+            "rationale": "Cheap, safe extra-low voltage; parts sold worldwide."}
+
+
+def module_out(code="solar-pump", standard="dc-bus-24v", projects=("P Water 0",)):
+    return {"summary": "s", "modules": [{
+        "code": code, "name": "Solar pump stage", "kind": "Hardware",
+        "purpose": "Lifts water from a well using DC power.",
+        "interfaces": [{"standard": standard, "role": "consumes"}],
+        "bom": [{"part": "DC pump", "quantity": 1, "unit_cost_eu": 80,
+                 "unit_cost_low_income": 45}],
+        "cost_eu": 120, "cost_low_income": 70, "maturity": "tested",
+        "source_projects": list(projects),
+        "new_standards": [{"code": "pipe-32", "name": "32 mm pipe", "kind": "fluid",
+                           "spec": "32 mm OD HDPE, compression fittings.",
+                           "rationale": "Common worldwide."}]}]}
+
+
+def system_out():
+    return {"summary": "s", "systems": [{
+        "code": "water", "name": "Household water", "purpose": "Safe water for a family.",
+        "modules": [{"module": "solar-pump", "quantity": 1}],
+        "calculations": [{"name": "Daily demand", "result": "120 L/day",
+                          "code": "print(6 * 20)", "label": "calculated"}],
+        "cost_eu": 300, "cost_low_income": 150, "missing_modules": ["chlorine doser"]}]}
+
+
+def roadmap_out():
+    return {"summary": "s", "roadmap": {
+        "summary": "Start with power, then water, then trials.",
+        "steps": [{"title": "Settle the DC bus", "kind": "standard", "refs": ["dc-bus-24v"]},
+                  {"title": "Trial the pump in summer", "kind": "trial",
+                   "refs": ["solar-pump"], "depends_on": [1], "season": "summer",
+                   "target_climates": ["Temperate", "moon"], "cost_eu": 200}]}}
+
+
+def approve_first_standard(client):
+    sid = client.get("/standards").json()[0]["id"]
+    r = client.post(f"/standards/{sid}/decision", json={"decision": "approved", "note": "ok"})
+    assert r.json()["status"] == "approved"
+
+
+def test_standards_start_once_enough_projects_are_screened(client):
+    import modular
+
+    screened(9)
+    assert discover(client)["modular"] == []
+    screened(1, prefix="Q")
+    [job] = discover(client)["modular"]
+    assert job["unit_key"] == f"standards-synthesis:{modular.month()}"
+    assert discover(client)["modular"] == []  # once a month
+    [(payload,)] = sql("SELECT input FROM jobs WHERE job_type = 'standards-synthesis'")
+    assert len(payload["projects"]) == 10 and "Global Village" in payload["instructions"]
+
+
+def test_modules_wait_for_an_approved_standard(client):
+    screened(10)
+    discover(client)
+    _, r = run_job(client, "standards-synthesis", {"summary": "s", "standards": [
+        STANDARD, {**STANDARD, "code": "lora-node", "name": "LoRa sensor node"}]})
+    assert r.status_code == 200, r.text
+    assert discover(client)["modular"] == []  # nothing approved yet
+    standards = client.get("/standards").json()
+    assert {s["code"]: s["status"] for s in standards} == {
+        "dc-bus-24v": "proposed", "lora-node": "proposed"}
+    assert standards[0]["kind"] == "electrical"
+    approve_first_standard(client)
+    [job] = discover(client)["modular"]
+    assert job["unit_key"].startswith("module-synthesis:category:")
+    [(payload,)] = sql("SELECT input FROM jobs WHERE job_type = 'module-synthesis'")
+    assert [s["code"] for s in payload["approved_standards"]] == ["dc-bus-24v"]
+    assert payload["domain"] == "Water" and len(payload["projects"]) == 10
+
+
+def test_a_decided_standard_is_not_overwritten(client):
+    screened(10)
+    discover(client)
+    run_job(client, "standards-synthesis", {"summary": "s", "standards": [STANDARD]})
+    approve_first_standard(client)
+    job_id = client.post("/jobs", json={"project_id": project(client, code="JOB-HOLDER"), "job_type": "standards-synthesis",
+                                        "input": {}}).json()["id"]
+    claim(client, APOLLO, ["standards-synthesis"])
+    r = client.post(f"/jobs/{job_id}/complete", json={"worker": APOLLO, "output": {
+        "summary": "s", "standards": [{**STANDARD, "spec": "48 V instead, a new idea."}]}})
+    assert r.status_code == 200, r.text
+    [standard] = client.get("/standards").json()
+    assert standard["status"] == "approved" and standard["spec"].startswith("24 V")
+
+
+def test_modules_are_upserted_and_keep_trial_maturity(client):
+    screened(10)
+    discover(client)
+    run_job(client, "standards-synthesis", {"summary": "s", "standards": [STANDARD]})
+    approve_first_standard(client)
+    discover(client)
+    _, r = run_job(client, "module-synthesis", module_out())
+    assert r.status_code == 200, r.text
+    [module] = client.get("/modules").json()
+    assert module["maturity"] == "concept"  # a model cannot claim "tested"
+    assert module["standards"] == ["dc-bus-24v"] and len(module["projects"]) == 1
+    assert module["cost_low_income"] == 70 and module["spec"]["domains"] == ["Water"]
+    assert {s["code"] for s in client.get("/standards").json()} == {"dc-bus-24v", "pipe-32"}
+    # Trials later mark it tested; a re-synthesis keeps that and merges projects.
+    sql("UPDATE modules SET maturity = 'tested'")
+    [(cid,)] = sql("SELECT id FROM need_categories WHERE name = 'Water'")
+    job_id = client.post("/jobs", json={
+        "project_id": project(client, code="JOB-HOLDER"), "job_type": "module-synthesis",
+        "input": {"category_id": cid, "domain": "Water"}}).json()["id"]
+    claim(client, APOLLO, ["module-synthesis"])
+    r = client.post(f"/jobs/{job_id}/complete", json={
+        "worker": APOLLO, "output": module_out(projects=("P Water 1",))})
+    assert r.status_code == 200, r.text
+    [module] = client.get("/modules").json()
+    assert module["maturity"] == "tested" and len(module["projects"]) == 2
+
+
+def test_systems_follow_the_module_wave_then_the_roadmap(client):
+    from psycopg.types.json import Jsonb
+
+    screened(10)
+    discover(client)
+    run_job(client, "standards-synthesis", {"summary": "s", "standards": [STANDARD]})
+    approve_first_standard(client)
+    discover(client)  # the module wave
+    for i in range(5):
+        sql("INSERT INTO modules (code, name, kind, domain, spec) VALUES (%s, %s, 'hardware', "
+            "'Water', %s)", f"m{i}", f"Module {i}", Jsonb({"purpose": "x", "interfaces": []}))
+    assert discover(client)["modular"] == []  # the month's module job is still queued
+    run_job(client, "module-synthesis", module_out())
+    systems = discover(client)["modular"]
+    assert sorted(j["unit_key"].split(":")[1] for j in systems) == sorted(
+        ["household", "homestead", "small-farm", "community-facility", "village"])
+    _, r = run_job(client, "system-design", system_out())
+    assert r.status_code == 200, r.text
+    [system] = client.get("/systems").json()
+    assert system["code"].endswith("-water") and system["spec"]["calculations"][0]["code"]
+    assert discover(client)["modular"] == []  # four system jobs still queued
+    sql("UPDATE jobs SET status = 'failed' WHERE job_type = 'system-design' AND status = 'queued'")
+    client.post("/sites", json={"code": "proving-ground", "profile": {"well": "not potable"}})
+    [roadmap_job] = discover(client)["modular"]
+    [(payload,)] = sql("SELECT input FROM jobs WHERE job_type = 'roadmap-revision'")
+    assert payload["proving_ground"] == [{"code": "proving-ground", "well": "not potable"}]
+    assert payload["systems"][0]["missing_modules"] == ["chlorine doser"]
+    _, r = run_job(client, "roadmap-revision", roadmap_out())
+    assert r.status_code == 200, r.text
+    [road] = client.get("/roadmaps").json()
+    assert road["status"] == "proposed" and road["steps"][1]["target_climates"] == ["temperate"]
+    assert road["steps"][1]["depends_on"] == [1]
+
+
+def test_one_approved_roadmap_at_a_time(client):
+    from psycopg.types.json import Jsonb
+
+    for v in ("202610", "202611"):
+        sql("INSERT INTO roadmaps (version, summary, steps) VALUES (%s, 'plan', %s)",
+            v, Jsonb([]))
+    first, second = sorted(client.get("/roadmaps").json(), key=lambda r: r["version"])
+    client.post(f"/roadmaps/{first['id']}/decision", json={"decision": "approved"})
+    client.post(f"/roadmaps/{second['id']}/decision", json={"decision": "approved"})
+    assert {r["version"]: r["status"] for r in client.get("/roadmaps").json()} == {
+        "202610": "superseded", "202611": "approved"}
+    assert client.post("/roadmaps/999/decision", json={"decision": "approved"}).status_code == 404
+
+
+@pytest.mark.parametrize("job_type, output", [
+    ("standards-synthesis", {"standards": [{**STANDARD, "spec": "short"}]}),
+    ("module-synthesis", {"modules": [{"code": "x", "name": "Pump", "purpose": "Pumps water."}]}),
+    ("system-design", {"systems": [{**system_out()["systems"][0], "modules": []}]}),
+    ("roadmap-revision", {"roadmap": {"summary": "too short", "steps": []}}),
+])
+def test_invalid_stage2_results_write_nothing(client, job_type, output):
+    job_id = client.post("/jobs", json={"project_id": project(client, code="JOB-HOLDER"), "job_type": job_type,
+                                        "input": {}}).json()["id"]
+    claim(client, APOLLO, [job_type])
+    r = client.post(f"/jobs/{job_id}/complete", json={"worker": APOLLO,
+                                                      "output": {"summary": "s", **output}})
+    assert r.status_code == 422, r.text
+    for table in ("standards", "modules", "systems", "roadmaps"):
+        assert sql(f"SELECT count(*) FROM {table}") == [(0,)]

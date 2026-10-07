@@ -2,6 +2,7 @@ import os
 import time
 from typing import Any
 
+import modular
 import research
 
 import psycopg
@@ -22,6 +23,10 @@ DEFAULT_JOB_TYPE_OWNERS = {
     "candidate-discovery": "apollo-hermes",
     "project-review": "apollo-hermes",
     "build-pack": "apollo-hermes",
+    "standards-synthesis": "apollo-hermes",
+    "module-synthesis": "apollo-hermes",
+    "system-design": "apollo-hermes",
+    "roadmap-revision": "apollo-hermes",
     "candidate-assessment": "apollo-hermes",
     "literature-collection": "apollo-hermes",
     "source-summarisation": "apollo-hermes",
@@ -130,6 +135,17 @@ class BacklogDiscover(BaseModel):
 class ProjectSteer(BaseModel):
     steer: str | None = Field(default=None, pattern="^(build|park)$")
     note: str = Field(default="", max_length=2000)
+
+
+class Decision(BaseModel):
+    """The maintainer's decision on a standard or a roadmap version."""
+    decision: str = Field(pattern="^(approved|rejected|proposed)$")
+    note: str = Field(default="", max_length=2000)
+
+
+class SiteIn(BaseModel):
+    code: str = Field(pattern="^[a-z0-9-]{2,40}$")
+    profile: dict[str, Any]
 
 
 class ArchiveRecord(BaseModel):
@@ -777,7 +793,11 @@ def discover_backlog(item: BacklogDiscover):
     6. review: a go/no-go project-review once an active project's
        questions are settled (build, continue with new questions, or park);
     7. build: one build-pack job per section for projects with a build
-       decision, and completion once every section has finished.
+       decision, and completion once every section has finished;
+    8. modular set (stage 2, section 4e): monthly standards synthesis;
+       module synthesis per domain once standards are approved; system
+       design per scenario after the month's modules; the roadmap after the
+       month's systems.
 
     Every job carries a stable unit key, so repeated runs never enqueue the
     same unit twice; completed or failed units are not re-enqueued. Topics
@@ -794,6 +814,7 @@ def discover_backlog(item: BacklogDiscover):
             reviews = _review_projects(cur, item.limit)
             builds = _build_packs(cur, item.limit)
             completed = _complete_builds(cur)
+            modular_set = _modular_set(cur, item.limit)
         conn.commit()
     return {
         "steered": steered,
@@ -805,7 +826,293 @@ def discover_backlog(item: BacklogDiscover):
         "reviews": reviews,
         "builds": builds,
         "completed": completed,
+        "modular": modular_set,
     }
+
+
+# ---------------------------------------------------------------------------
+# Stage 2: the modular set (policy section 4e; modular.py)
+# ---------------------------------------------------------------------------
+
+
+def _clip(text: Any, limit: int) -> str:
+    return str(text or "")[:limit]
+
+
+def _build_digest(cur, project_id) -> dict:
+    """The parts of a project's latest build pack a synthesis needs."""
+    cur.execute(
+        "SELECT DISTINCT ON (section) section, content FROM build_packs "
+        "WHERE project_id = %s ORDER BY section, created_at DESC, id DESC",
+        (project_id,),
+    )
+    build = {r["section"]: r["content"] for r in cur.fetchall()}
+    out = {}
+    if build.get("bom"):
+        out["bom"] = [{"part": _clip(i.get("part"), 120), "spec": _clip(i.get("spec"), 120),
+                       "unit_cost": i.get("unit_cost"), "currency": i.get("currency")}
+                      for i in build["bom"].get("items", [])[:30]]
+    if build.get("design"):
+        out["design"] = ([_clip(r.get("url"), 200) for r in build["design"].get("repositories", [])]
+                         + [f"{_clip(f.get('name'), 80)} ({f.get('kind')})"
+                            for f in build["design"].get("files", [])[:15]])
+    if build.get("assembly"):
+        out["assembly_steps"] = [_clip(s.get("step"), 120)
+                                 for s in build["assembly"].get("steps", [])[:20]]
+    return out
+
+
+def _projects_digest(cur, category_id=None, limit=120, detail=False) -> list[dict]:
+    """Assessed projects (all, or one category's), most promising first."""
+    cur.execute(
+        """
+        SELECT DISTINCT ON (p.id) p.id, p.name, p.status, p.summary, p.climates,
+               p.serves, p.score, c.name AS category, c.track, a.rationale
+        FROM projects p JOIN assessments a ON a.project_id = p.id
+        LEFT JOIN need_categories c ON c.id = p.category_id
+        WHERE (%s::bigint IS NULL OR p.category_id = %s::bigint)
+        ORDER BY p.id, a.created_at DESC
+        """,
+        (category_id, category_id),
+    )
+    rows = sorted(cur.fetchall(), key=lambda r: -(r["score"] or 0))[:limit]
+    out = []
+    for r in rows:
+        item = {"name": r["name"], "category": r["category"], "status": r["status"],
+                "summary": _clip(r["summary"], 600 if detail else 300),
+                "climates": r["climates"]}
+        if r["track"] == research.ENABLER:
+            item["serves"] = r["serves"]
+        if detail:
+            cur.execute("SELECT finding FROM findings WHERE project_id = %s "
+                        "ORDER BY confidence DESC NULLS LAST, id LIMIT 8", (r["id"],))
+            item["rationale"] = _clip(r["rationale"], 500)
+            item["findings"] = [_clip(f["finding"], 300) for f in cur.fetchall()]
+        item.update(_build_digest(cur, r["id"]))
+        if not detail:
+            item.pop("assembly_steps", None)
+            item["bom"] = [b["part"] for b in item.get("bom", [])][:12]
+        out.append(item)
+    return out
+
+
+def _standards_digest(cur, approved_only=True) -> list[dict]:
+    cur.execute(
+        "SELECT code, name, kind, spec, status FROM standards "
+        + ("WHERE status = 'approved' " if approved_only else "WHERE status <> 'rejected' ")
+        + "ORDER BY code"
+    )
+    return [{"code": r["code"], "name": r["name"], "kind": r["kind"],
+             "spec": _clip(r["spec"], 600), **({} if approved_only else {"status": r["status"]})}
+            for r in cur.fetchall()]
+
+
+def _modules_digest(cur, limit=150) -> list[dict]:
+    cur.execute("SELECT code, name, kind, domain, maturity, cost_eu, cost_low_income, spec "
+                "FROM modules ORDER BY domain, code LIMIT %s", (limit,))
+    return [{"code": r["code"], "name": r["name"], "kind": r["kind"], "domain": r["domain"],
+             "maturity": r["maturity"], "purpose": _clip(r["spec"].get("purpose"), 240),
+             "interfaces": [{"standard": i.get("standard"), "role": i.get("role")}
+                            for i in r["spec"].get("interfaces", [])],
+             "cost_eu": r["cost_eu"], "cost_low_income": r["cost_low_income"]}
+            for r in cur.fetchall()]
+
+
+def _wave_pending(cur, job_type: str, month: str) -> bool:
+    """A job of this type for this month is still queued or running."""
+    cur.execute("SELECT 1 FROM jobs WHERE job_type = %s AND unit_key LIKE %s "
+                "AND status IN ('queued', 'running') LIMIT 1",
+                (job_type, f"%:{month}"))
+    return cur.fetchone() is not None
+
+
+def _modular_set(cur, budget: int, month: str | None = None) -> list:
+    """Stage 2, one bounded step (policy section 4e): standards, then
+    modules per domain once any standard is approved, then systems per
+    scenario after the month's modules, then the roadmap after the month's
+    systems. Each kind runs once a month."""
+    month = month or modular.month()
+    created = []
+
+    def enqueue(key, job_type, payload):
+        if len(created) >= budget or _unit_exists(cur, key):
+            return
+        job = _enqueue(cur, unit_key=key, job_type=job_type,
+                       priority=modular.PRIORITY, payload=payload)
+        if job:
+            created.append(job)
+
+    cur.execute("SELECT count(DISTINCT project_id) AS n FROM assessments")
+    if cur.fetchone()["n"] < modular.MIN_ASSESSED_FOR_STANDARDS:
+        return created
+    enqueue(f"{modular.STANDARDS}:{month}", modular.STANDARDS,
+            modular.standards_input(_projects_digest(cur), _standards_digest(cur, False)))
+
+    standards = _standards_digest(cur)
+    if not standards:
+        return created  # modules wait for the maintainer's first approvals
+    for category in _focus_categories(cur):
+        cur.execute("SELECT count(DISTINCT a.project_id) AS n FROM assessments a "
+                    "JOIN projects p ON p.id = a.project_id WHERE p.category_id = %s",
+                    (category["id"],))
+        if cur.fetchone()["n"] < modular.MIN_ASSESSED_PER_DOMAIN:
+            continue
+        key = f"{modular.MODULES}:category:{category['id']}:{month}"
+        if _unit_exists(cur, key):
+            continue
+        enqueue(key, modular.MODULES, {
+            "category_id": category["id"],
+            **modular.module_input(category, _latest_brief(cur, category["id"]),
+                                   _projects_digest(cur, category["id"], 25, detail=True),
+                                   standards, _modules_digest(cur))})
+
+    if _wave_pending(cur, modular.MODULES, month):
+        return created
+    cur.execute("SELECT count(*) AS n FROM modules")
+    if cur.fetchone()["n"] < modular.MIN_MODULES_FOR_SYSTEMS:
+        return created
+    briefs = _briefs_digest(cur)
+    for scenario in modular.SCENARIOS:
+        key = f"{modular.SYSTEMS}:{scenario}:{month}"
+        if not _unit_exists(cur, key):
+            enqueue(key, modular.SYSTEMS, {
+                "scenario": scenario,
+                **modular.system_input(scenario, briefs, _modules_digest(cur), standards)})
+
+    if _wave_pending(cur, modular.SYSTEMS, month):
+        return created
+    cur.execute("SELECT code, name, scenario, cost_eu, cost_low_income, modules, spec "
+                "FROM systems ORDER BY scenario, code")
+    systems = [{"code": r["code"], "name": r["name"], "scenario": r["scenario"],
+                "purpose": _clip(r["spec"].get("purpose"), 300),
+                "modules": [m.get("module") for m in r["modules"]],
+                "missing_modules": r["spec"].get("missing_modules", []),
+                "cost_eu": r["cost_eu"], "cost_low_income": r["cost_low_income"]}
+               for r in cur.fetchall()]
+    if not systems:
+        return created
+    key = f"{modular.ROADMAP}:{month}"
+    if not _unit_exists(cur, key):
+        cur.execute("SELECT version, summary, steps FROM roadmaps WHERE status = 'approved' "
+                    "ORDER BY created_at DESC LIMIT 1")
+        previous = cur.fetchone()
+        cur.execute("SELECT code, profile FROM sites ORDER BY code")
+        sites = [{"code": r["code"], **r["profile"]} for r in cur.fetchall()]
+        enqueue(key, modular.ROADMAP, {
+            "version": month,
+            **modular.roadmap_input(month, systems, _modules_digest(cur), standards,
+                                    previous, sites)})
+    return created
+
+
+def _briefs_digest(cur) -> list[dict]:
+    cur.execute(
+        """
+        SELECT DISTINCT ON (c.id) c.name, c.layer, c.track, b.brief
+        FROM need_categories c JOIN need_briefs b ON b.category_id = c.id
+        ORDER BY c.id, b.created_at DESC, b.id DESC
+        """
+    )
+    return [{"category": r["name"], "layer": r["layer"], "track": r["track"],
+             "requirements": (r["brief"].get("requirements") or [])[:6],
+             "constraints": (r["brief"].get("constraints") or [])[:4]}
+            for r in cur.fetchall()]
+
+
+def _upsert_standard(cur, job_id, s) -> str:
+    """Insert a proposed standard, or refresh one still proposed; a
+    decided standard (approved or rejected) is never overwritten."""
+    cur.execute(
+        """
+        INSERT INTO standards (code, name, kind, spec, rationale, used_by, job_id)
+        VALUES (%s, %s, %s, %s, %s, %s, %s)
+        ON CONFLICT (code) DO UPDATE SET
+            name = EXCLUDED.name, kind = EXCLUDED.kind, spec = EXCLUDED.spec,
+            rationale = EXCLUDED.rationale, used_by = EXCLUDED.used_by,
+            job_id = EXCLUDED.job_id, updated_at = NOW()
+        WHERE standards.status = 'proposed'
+        RETURNING status
+        """,
+        (s.code, s.name, s.kind, s.spec, s.rationale, Jsonb(s.used_by), job_id),
+    )
+    row = cur.fetchone()
+    return row["status"] if row else "kept"
+
+
+def _store_modular(cur, job, result) -> dict:
+    job_type, job_id, inp = job["job_type"], job["id"], job["input"] or {}
+    if job_type == modular.STANDARDS:
+        statuses = [_upsert_standard(cur, job_id, s) for s in result.standards]
+        return {"standards": len(statuses)}
+
+    if job_type == modular.MODULES:
+        cur.execute("SELECT id, lower(name) AS name FROM projects WHERE category_id = %s",
+                    (inp.get("category_id"),))
+        by_name = {r["name"]: r["id"] for r in cur.fetchall()}
+        for m in result.modules:
+            for s in m.new_standards:
+                _upsert_standard(cur, job_id, s)
+            projects = sorted({by_name[n.lower()] for n in m.source_projects
+                               if n.lower() in by_name})
+            spec = m.model_dump(exclude={"new_standards"})
+            cur.execute("SELECT maturity, projects, spec FROM modules WHERE code = %s", (m.code,))
+            old = cur.fetchone()
+            maturity = m.maturity
+            if old:
+                if modular.MATURITY.index(old["maturity"]) > modular.MATURITY.index(maturity):
+                    maturity = old["maturity"]  # built/tested come from trials
+                projects = sorted(set(projects) | set(old["projects"]))
+                spec["domains"] = sorted(set(old["spec"].get("domains", [])) | {inp["domain"]})
+            else:
+                spec["domains"] = [inp["domain"]]
+            cur.execute(
+                """
+                INSERT INTO modules (code, name, kind, domain, maturity, cost_eu,
+                                     cost_low_income, standards, projects, spec, job_id)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (code) DO UPDATE SET
+                    name = EXCLUDED.name, kind = EXCLUDED.kind, maturity = EXCLUDED.maturity,
+                    cost_eu = EXCLUDED.cost_eu, cost_low_income = EXCLUDED.cost_low_income,
+                    standards = EXCLUDED.standards, projects = EXCLUDED.projects,
+                    spec = EXCLUDED.spec, job_id = EXCLUDED.job_id, updated_at = NOW()
+                """,
+                (m.code, m.name, m.kind, inp["domain"], maturity, m.cost_eu,
+                 m.cost_low_income, Jsonb(sorted({i.standard for i in m.interfaces})),
+                 Jsonb(projects), Jsonb(spec), job_id),
+            )
+        return {"modules": len(result.modules)}
+
+    if job_type == modular.SYSTEMS:
+        scenario = inp["scenario"]
+        for s in result.systems:
+            code = s.code if s.code.startswith(scenario) else modular.slug(f"{scenario}-{s.code}")
+            cur.execute(
+                """
+                INSERT INTO systems (code, name, scenario, cost_eu, cost_low_income,
+                                     modules, spec, job_id)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (code) DO UPDATE SET
+                    name = EXCLUDED.name, cost_eu = EXCLUDED.cost_eu,
+                    cost_low_income = EXCLUDED.cost_low_income, modules = EXCLUDED.modules,
+                    spec = EXCLUDED.spec, job_id = EXCLUDED.job_id, updated_at = NOW()
+                """,
+                (code, s.name, scenario, s.cost_eu, s.cost_low_income,
+                 Jsonb([m.model_dump() for m in s.modules]), Jsonb(s.model_dump()), job_id),
+            )
+        return {"systems": len(result.systems)}
+
+    # roadmap-revision: a new proposed version; older proposals are superseded.
+    version = inp.get("version") or modular.month()
+    cur.execute("SELECT count(*) AS n FROM roadmaps WHERE version LIKE %s", (f"{version}%",))
+    n = cur.fetchone()["n"]
+    version = version if n == 0 else f"{version}-{n + 1}"
+    cur.execute("UPDATE roadmaps SET status = 'superseded' WHERE status = 'proposed'")
+    road = result.roadmap
+    cur.execute(
+        "INSERT INTO roadmaps (version, summary, steps, job_id) VALUES (%s, %s, %s, %s)",
+        (version, road.summary, Jsonb([s.model_dump() for s in road.steps]), job_id),
+    )
+    return {"roadmap": version}
 
 
 @app.get("/portfolio")
@@ -969,6 +1276,95 @@ def project_record(project_id: int):
                     "status, path, bytes, sha256, note, created_at "
                     "FROM design_archives WHERE project_id = %s ORDER BY id"),
             }
+
+
+@app.get("/standards")
+def get_standards():
+    """Interface standards, proposed and decided (section 4e)."""
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id, code, name, kind, spec, rationale, used_by, status, "
+                        "decision_note, decided_at, created_at, updated_at "
+                        "FROM standards ORDER BY kind, code")
+            return cur.fetchall()
+
+
+def _decide_on(table: str, item_id: int, item: Decision) -> dict:
+    with db() as conn:
+        with conn.cursor() as cur:
+            if table == "roadmaps" and item.decision == "approved":
+                # One approved roadmap at a time: the older one is superseded.
+                cur.execute("UPDATE roadmaps SET status = 'superseded' "
+                            "WHERE status = 'approved' AND id <> %s", (item_id,))
+            cur.execute(
+                f"UPDATE {table} SET status = %s, decision_note = %s, decided_at = NOW() "
+                f"WHERE id = %s RETURNING id, status",
+                (item.decision, item.note or None, item_id),
+            )
+            result = cur.fetchone()
+        conn.commit()
+    if result is None:
+        raise HTTPException(status_code=404, detail="not found")
+    return result
+
+
+@app.post("/standards/{standard_id}/decision")
+def decide_standard(standard_id: int, item: Decision):
+    """The maintainer approves or rejects a proposed standard; modules are
+    specified only against approved ones."""
+    return _decide_on("standards", standard_id, item)
+
+
+@app.get("/modules")
+def get_modules():
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id, code, name, kind, domain, maturity, cost_eu, "
+                        "cost_low_income, standards, projects, spec, created_at, updated_at "
+                        "FROM modules ORDER BY domain, code")
+            return cur.fetchall()
+
+
+@app.get("/systems")
+def get_systems():
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id, code, name, scenario, cost_eu, cost_low_income, "
+                        "modules, spec, created_at, updated_at FROM systems "
+                        "ORDER BY scenario, code")
+            return cur.fetchall()
+
+
+@app.get("/roadmaps")
+def get_roadmaps():
+    """Roadmap versions, newest first (proposed, approved, superseded)."""
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id, version, status, summary, steps, decision_note, "
+                        "decided_at, created_at FROM roadmaps ORDER BY created_at DESC, id DESC")
+            return cur.fetchall()
+
+
+@app.post("/roadmaps/{roadmap_id}/decision")
+def decide_roadmap(roadmap_id: int, item: Decision):
+    return _decide_on("roadmaps", roadmap_id, item)
+
+
+@app.post("/sites")
+def set_site(item: SiteIn):
+    """A proving-ground profile, set from a private file on the host; it
+    reaches only roadmap revisions."""
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO sites (code, profile) VALUES (%s, %s) ON CONFLICT (code) "
+                "DO UPDATE SET profile = EXCLUDED.profile, updated_at = NOW() "
+                "RETURNING code, updated_at",
+                (item.code, Jsonb(item.profile)),
+            )
+            result = cur.fetchone()
+        conn.commit()
+    return result
 
 
 @app.get("/archives/pending")
@@ -1341,6 +1737,8 @@ def complete_job(job_id: int, item: JobComplete):
                   if job_type == research.REVIEW else None)
         build = (research.validate_build(section, item.output)
                  if job_type == research.BUILD_PACK else None)
+        stage2 = (modular.validate(job_type, item.output)
+                  if job_type in modular.JOB_TYPES else None)
         if assessment is not None:
             # Only an enabler lists the needs it serves (section 2a).
             assessment.serves = list(dict.fromkeys(
@@ -1431,6 +1829,8 @@ def complete_job(job_id: int, item: JobComplete):
                         "VALUES (%s, %s, %s, %s)",
                         (result["project_id"], job_id, section, Jsonb(build)),
                     )
+                elif stage2 is not None:
+                    extra = _store_modular(cur, result, stage2)
                 elif job_type == research.LITERATURE and result["question_id"]:
                     cur.execute(
                         "UPDATE questions SET status = 'answered' "
