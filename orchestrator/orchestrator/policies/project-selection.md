@@ -33,7 +33,7 @@ Explain the link between the work and the need. A remote possibility that a tech
 
 2a. Enablers
 
-Some work is not a need in itself but something many needs depend on: energy, communications, environment and climate, fabrication, skills and others (taxonomy.md, Enablers). Enablers form a track alongside the layers rather than a layer of their own. Each enabler category has its own need brief, framed by the essential needs that depend on it, and its own discovery.
+Some work is not a need in itself but something many needs depend on: energy, communications, environment and climate, fabrication, instrumentation and control, skills and others (taxonomy.md, Enablers). Enablers form a track alongside the layers rather than a layer of their own. Each enabler category has its own need brief, framed by the essential needs that depend on it, and its own discovery.
 
 An enabler project is screened on the needs it serves: its assessment lists the physiological and safety need categories it directly makes easier to meet, and the project takes the most basic layer among them for the need-layer score. The other dimensions are scored on those needs. Environment and climate as an enabler (carbon removal, ecosystem restoration, adaptation) is distinct from the Safety category Environmental stability and resource security (exposure and access), and both remain.
 
@@ -303,4 +303,4 @@ Design files are kept as pinned local copies when their licence allows (section 
 
 Software and data projects stay in the catalogue. Their build pack documents a working deployment: the hardware, hosting and services needed with their costs; source repositories, data and configuration; installation and deployment; and verification of a running instance.
 
-Enablers are a track alongside the layers (section 2a), starting with Energy, Communications and information, and Environment and climate, then Fabrication and tools, Transport and logistics, Sensing and monitoring, Skills and know-how (including maintenance and repair), Computing and open data, Cold chain and storage, Mapping and geospatial, Finance and payments, and Materials and circularity; more may be added. Environmental enablers and the environmental Safety need both stay. Enablers compete equally for slots, with a slight attention bump.
+Enablers are a track alongside the layers (section 2a), starting with Energy, Communications and information, and Environment and climate, then Fabrication and tools, Transport and logistics, Instrumentation and control, Skills and know-how (including maintenance and repair), Computing and open data, Cold chain and storage, Mapping and geospatial, Finance and payments, and Materials and circularity; more may be added. Environmental enablers and the environmental Safety need both stay. Enablers compete equally for slots, with a slight attention bump.
