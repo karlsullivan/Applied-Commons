@@ -812,3 +812,16 @@ def test_enablers_get_a_slight_admission_bump(client, monkeypatch):
     assert scores["Rope Pump"] > scores["Solar Water Pump"]  # recorded honestly
     assert len(discover(client)["admitted"]) == 1
     assert sql("SELECT name FROM projects WHERE status = 'active'") == [("Solar Water Pump",)]
+
+
+def test_the_briefly_deployed_sensing_category_is_removed(client):
+    sql("INSERT INTO need_categories (name, scope, track) "
+        "VALUES ('Sensing and monitoring', 'x', 'enabler')")
+    discover(client)  # queues its brief
+    assert sql("SELECT count(*) FROM jobs j JOIN need_categories c "
+               "ON j.input->>'category_id' = c.id::text "
+               "WHERE c.name = 'Sensing and monitoring'") == [(1,)]
+    sql((ROOT / "database" / "migrations" / "008_drop_sensing.sql").read_text())
+    assert sql("SELECT count(*) FROM need_categories "
+               "WHERE name = 'Sensing and monitoring'") == [(0,)]
+    assert sql("SELECT count(*) FROM jobs WHERE job_type = 'need-brief'") == [(FOCUS_CATEGORIES,)]
