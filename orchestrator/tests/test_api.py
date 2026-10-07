@@ -925,7 +925,15 @@ def roadmap_out():
                    "target_climates": ["Temperate", "moon"], "cost_eu": 200}]}}
 
 
+def verify_standards():
+    """Mark every standard's current spec verified (as a verification would)."""
+    sql("UPDATE standards SET verified_hash = "
+        "left(encode(sha256(convert_to(spec, 'UTF8')), 'hex'), 16)")
+    sql("UPDATE jobs SET status = 'completed' WHERE job_type = 'standard-verification'")
+
+
 def approve_first_standard(client):
+    verify_standards()
     sid = client.get("/standards").json()[0]["id"]
     r = client.post(f"/standards/{sid}/decision", json={"decision": "approved", "note": "ok"})
     assert r.json()["status"] == "approved"
@@ -950,7 +958,8 @@ def test_modules_wait_for_an_approved_standard(client):
     _, r = run_job(client, "standards-synthesis", {"summary": "s", "standards": [
         STANDARD, {**STANDARD, "code": "lora-node", "name": "LoRa sensor node"}]})
     assert r.status_code == 200, r.text
-    assert discover(client)["modular"] == []  # nothing approved yet
+    step = discover(client)["modular"]  # verifications only: nothing approved yet
+    assert {j["job_type"] for j in step} == {"standard-verification"} and len(step) == 2
     standards = client.get("/standards").json()
     assert {s["code"]: s["status"] for s in standards} == {
         "dc-bus-24v": "proposed", "lora-node": "proposed"}
@@ -1018,7 +1027,7 @@ def test_systems_follow_the_module_wave_then_the_roadmap(client):
             "'Water', %s)", f"m{i}", f"Module {i}", Jsonb({"purpose": "x", "interfaces": []}))
     assert discover(client)["modular"] == []  # the month's module job is still queued
     run_job(client, "module-synthesis", module_out())
-    systems = discover(client)["modular"]
+    systems = [j for j in discover(client)["modular"] if j["job_type"] == "system-design"]
     assert sorted(j["unit_key"].split(":")[1] for j in systems) == sorted(
         ["household", "homestead", "small-farm", "community-facility", "village"])
     _, r = run_job(client, "system-design", system_out())
@@ -1068,3 +1077,84 @@ def test_invalid_stage2_results_write_nothing(client, job_type, output):
     assert r.status_code == 422, r.text
     for table in ("standards", "modules", "systems", "roadmaps"):
         assert sql(f"SELECT count(*) FROM {table}") == [(0,)]
+
+
+VERIFIED = {"summary": "s", "verification": {
+    "outcome": "deviates", "safety_critical": False,
+    "references": [{"body": "IEC", "number": "IEC 60364-4-41", "title": "Protection for safety",
+                    "url": "https://webstore.iec.ch/publication/1878"}],
+    "deviations": [{"reference": "IEC 60364-4-41", "deviation": "No RCD on the DC bus.",
+                    "risk": "Low", "justification": "Extra-low voltage."}],
+    "required_controls": ["Fuse each branch."], "recommendation": "Approve",
+    "rationale": "Extra-low voltage DC; consistent apart from the listed deviation."}}
+
+
+def test_standards_are_verified_before_they_can_be_approved(client):
+    import modular
+
+    screened(10)
+    discover(client)
+    run_job(client, "standards-synthesis", {"summary": "s", "standards": [STANDARD]})
+    [job] = discover(client)["modular"]
+    [standard] = client.get("/standards").json()
+    assert job["unit_key"] == (f"standard-verification:{standard['id']}:"
+                               f"{modular.spec_hash(standard['spec'])}")
+    assert job["priority"] == modular.VERIFY_PRIORITY and standard["verified"] is False
+    r = client.post(f"/standards/{standard['id']}/decision", json={"decision": "approved"})
+    assert r.status_code == 409
+    claimed, r = run_job(client, "standard-verification", VERIFIED)
+    assert r.status_code == 200 and r.json()["outcome"] == "deviates", r.text
+    assert "AS/NZS" in claimed["input"]["instructions"]
+    [standard] = client.get("/standards").json()
+    assert standard["verified"] is True
+    verification = standard["verification"]
+    assert verification["deviations"][0]["risk"] == "low"
+    assert verification["recommendation"] == "approve"
+    assert discover(client)["modular"] == [] or all(
+        j["job_type"] != "standard-verification" for j in discover(client)["modular"])
+    r = client.post(f"/standards/{standard['id']}/decision", json={"decision": "approved"})
+    assert r.status_code == 200 and r.json()["status"] == "approved"
+
+
+def test_a_revised_proposal_is_verified_again(client):
+    screened(10)
+    discover(client)
+    run_job(client, "standards-synthesis", {"summary": "s", "standards": [STANDARD]})
+    discover(client)
+    run_job(client, "standard-verification", VERIFIED)
+    # A later proposal revises the still-proposed standard's spec.
+    job_id = client.post("/jobs", json={"project_id": project(client, code="JOB-HOLDER"),
+                                        "job_type": "standards-synthesis", "input": {}}).json()["id"]
+    claim(client, APOLLO, ["standards-synthesis"])
+    client.post(f"/jobs/{job_id}/complete", json={"worker": APOLLO, "output": {
+        "summary": "s", "standards": [{**STANDARD, "spec": "48 V nominal DC, Anderson SB50."}]}})
+    [standard] = client.get("/standards").json()
+    assert standard["verified"] is False  # the earlier verification was of the old spec
+    jobs = [j for j in discover(client)["modular"] if j["job_type"] == "standard-verification"]
+    assert len(jobs) == 1
+    # Rejecting needs no verification.
+    r = client.post(f"/standards/{standard['id']}/decision", json={"decision": "rejected"})
+    assert r.status_code == 200
+
+
+@pytest.mark.parametrize("change", [
+    {"outcome": "deviates", "deviations": []},
+    {"outcome": "unsafe", "deviations": []},
+    {"outcome": "maybe"},
+    {"recommendation": "shrug"},
+])
+def test_verifications_must_call_out_deviations(client, change):
+    job_id = client.post("/jobs", json={"project_id": project(client, code="JOB-HOLDER"),
+                                        "job_type": "standard-verification",
+                                        "input": {"standard_id": 1, "spec_hash": "x"}}).json()["id"]
+    claim(client, APOLLO, ["standard-verification"])
+    output = {"summary": "s", "verification": {**VERIFIED["verification"], **change}}
+    r = client.post(f"/jobs/{job_id}/complete", json={"worker": APOLLO, "output": output})
+    assert r.status_code == 422, r.text
+
+
+def test_listed_deviations_make_an_aligned_verification_deviate():
+    import modular
+
+    v = modular.Verification(**{**VERIFIED["verification"], "outcome": "aligned"})
+    assert v.outcome == "deviates"

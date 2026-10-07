@@ -24,6 +24,7 @@ DEFAULT_JOB_TYPE_OWNERS = {
     "project-review": "apollo-hermes",
     "build-pack": "apollo-hermes",
     "standards-synthesis": "apollo-hermes",
+    "standard-verification": "apollo-hermes",
     "module-synthesis": "apollo-hermes",
     "system-design": "apollo-hermes",
     "roadmap-revision": "apollo-hermes",
@@ -927,20 +928,31 @@ def _wave_pending(cur, job_type: str, month: str) -> bool:
 
 
 def _modular_set(cur, budget: int, month: str | None = None) -> list:
-    """Stage 2, one bounded step (policy section 4e): standards, then
+    """Stage 2, one bounded step (policy section 4e): a verification of each
+    proposed standard (again whenever its spec changes); standards, then
     modules per domain once any standard is approved, then systems per
     scenario after the month's modules, then the roadmap after the month's
-    systems. Each kind runs once a month."""
+    systems. Each of those kinds runs once a month."""
     month = month or modular.month()
     created = []
 
-    def enqueue(key, job_type, payload):
+    def enqueue(key, job_type, payload, priority=modular.PRIORITY):
         if len(created) >= budget or _unit_exists(cur, key):
             return
         job = _enqueue(cur, unit_key=key, job_type=job_type,
-                       priority=modular.PRIORITY, payload=payload)
+                       priority=priority, payload=payload)
         if job:
             created.append(job)
+
+    cur.execute("SELECT id, code, name, kind, spec, rationale, verified_hash "
+                "FROM standards WHERE status = 'proposed' ORDER BY id")
+    for standard in cur.fetchall():
+        digest = modular.spec_hash(standard["spec"])
+        if standard["verified_hash"] != digest:
+            enqueue(f"{modular.VERIFY}:{standard['id']}:{digest}", modular.VERIFY,
+                    {"standard_id": standard["id"], "spec_hash": digest,
+                     **modular.verification_input(standard)},
+                    priority=modular.VERIFY_PRIORITY)
 
     cur.execute("SELECT count(DISTINCT project_id) AS n FROM assessments")
     if cur.fetchone()["n"] < modular.MIN_ASSESSED_FOR_STANDARDS:
@@ -1041,6 +1053,18 @@ def _upsert_standard(cur, job_id, s) -> str:
 
 def _store_modular(cur, job, result) -> dict:
     job_type, job_id, inp = job["job_type"], job["id"], job["input"] or {}
+    if job_type == modular.VERIFY:
+        # Recorded against the spec that was verified; a spec changed since
+        # stays unverified and gets a new verification.
+        cur.execute(
+            "UPDATE standards SET verification = %s, verified_hash = %s, verified_at = NOW() "
+            "WHERE id = %s AND status = 'proposed' RETURNING id",
+            (Jsonb(result.verification.model_dump()), inp.get("spec_hash"),
+             inp.get("standard_id")),
+        )
+        return {"verified": cur.fetchone() is not None,
+                "outcome": result.verification.outcome}
+
     if job_type == modular.STANDARDS:
         statuses = [_upsert_standard(cur, job_id, s) for s in result.standards]
         return {"standards": len(statuses)}
@@ -1280,13 +1304,18 @@ def project_record(project_id: int):
 
 @app.get("/standards")
 def get_standards():
-    """Interface standards, proposed and decided (section 4e)."""
+    """Interface standards, proposed and decided (section 4e), with their
+    verification; ``verified`` means the current spec was verified."""
     with db() as conn:
         with conn.cursor() as cur:
             cur.execute("SELECT id, code, name, kind, spec, rationale, used_by, status, "
-                        "decision_note, decided_at, created_at, updated_at "
+                        "decision_note, decided_at, verification, verified_hash, "
+                        "verified_at, created_at, updated_at "
                         "FROM standards ORDER BY kind, code")
-            return cur.fetchall()
+            rows = cur.fetchall()
+    for row in rows:
+        row["verified"] = row.pop("verified_hash") == modular.spec_hash(row["spec"])
+    return rows
 
 
 def _decide_on(table: str, item_id: int, item: Decision) -> dict:
@@ -1311,7 +1340,19 @@ def _decide_on(table: str, item_id: int, item: Decision) -> dict:
 @app.post("/standards/{standard_id}/decision")
 def decide_standard(standard_id: int, item: Decision):
     """The maintainer approves or rejects a proposed standard; modules are
-    specified only against approved ones."""
+    specified only against approved ones. Approval needs a verification of
+    the current spec (standard-verification); rejection does not."""
+    if item.decision == "approved":
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT spec, verified_hash FROM standards WHERE id = %s",
+                            (standard_id,))
+                row = cur.fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail="not found")
+        if row["verified_hash"] != modular.spec_hash(row["spec"]):
+            raise HTTPException(status_code=409,
+                                detail="not verified yet: approve after its verification")
     return _decide_on("standards", standard_id, item)
 
 

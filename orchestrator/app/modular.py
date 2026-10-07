@@ -24,20 +24,28 @@ tested come from trials.
 
 from __future__ import annotations
 
+import hashlib
 import re
 import time
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 import research
 
 STANDARDS = "standards-synthesis"
+VERIFY = "standard-verification"
 MODULES = "module-synthesis"
 SYSTEMS = "system-design"
 ROADMAP = "roadmap-revision"
-JOB_TYPES = (STANDARDS, MODULES, SYSTEMS, ROADMAP)
+JOB_TYPES = (STANDARDS, VERIFY, MODULES, SYSTEMS, ROADMAP)
 PRIORITY = 0.88
+VERIFY_PRIORITY = 0.9
+
+#: Verification of a proposed standard (policy section 4e).
+OUTCOMES = ("aligned", "deviates", "no-standard", "unsafe")
+RECOMMENDATIONS = ("approve", "revise", "reject")
+RISKS = ("low", "medium", "high")
 
 #: The five scenarios systems are designed for (maintainer, 2026-10-07).
 SCENARIOS = {
@@ -59,6 +67,11 @@ MODEL_MATURITY = ("concept", "documented")
 MIN_ASSESSED_FOR_STANDARDS = 10
 MIN_ASSESSED_PER_DOMAIN = 2
 MIN_MODULES_FOR_SYSTEMS = 5
+
+
+def spec_hash(spec: str) -> str:
+    """Identifies the version of a standard's spec that was verified."""
+    return hashlib.sha256(spec.encode()).hexdigest()[:16]
 
 
 def month(now: float | None = None) -> str:
@@ -117,6 +130,75 @@ class StandardIn(_Coded):
 
 class StandardsResult(BaseModel):
     standards: list[StandardIn] = Field(max_length=10)
+
+
+class Reference(BaseModel):
+    body: str = Field(default="", max_length=40)
+    number: str = Field(min_length=1, max_length=80)
+    title: str = Field(default="", max_length=300)
+    url: str | None = None
+    relevance: str = Field(default="", max_length=600)
+
+    @field_validator("url")
+    @classmethod
+    def _url(cls, value):
+        return research._check_url(value)
+
+
+class Deviation(BaseModel):
+    reference: str = Field(default="", max_length=120)
+    deviation: str = Field(min_length=5, max_length=1500)
+    risk: str = "medium"
+    justification: str = Field(default="", max_length=1500)
+
+    @field_validator("risk")
+    @classmethod
+    def _risk(cls, value):
+        return _choice(value, RISKS, "medium")
+
+
+class Verification(BaseModel):
+    outcome: str
+    safety_critical: bool
+    references: list[Reference] = Field(default_factory=list, max_length=15)
+    deviations: list[Deviation] = Field(default_factory=list, max_length=15)
+    required_controls: list[str] = Field(default_factory=list, max_length=15)
+    recommendation: str
+    rationale: str = Field(min_length=20, max_length=3000)
+
+    @field_validator("outcome")
+    @classmethod
+    def _outcome(cls, value):
+        value = str(value).strip().lower()
+        if value not in OUTCOMES:
+            raise ValueError(f"outcome must be one of {list(OUTCOMES)}")
+        return value
+
+    @field_validator("recommendation")
+    @classmethod
+    def _recommendation(cls, value):
+        value = str(value).strip().lower()
+        if value not in RECOMMENDATIONS:
+            raise ValueError(f"recommendation must be one of {list(RECOMMENDATIONS)}")
+        return value
+
+    @field_validator("required_controls")
+    @classmethod
+    def _controls(cls, items):
+        return [str(i)[:500] for i in items]
+
+    @model_validator(mode="after")
+    def _deviations_called_out(self):
+        # Every deviation is called out; listed deviations make it "deviates".
+        if self.outcome in ("deviates", "unsafe") and not self.deviations:
+            raise ValueError(f"outcome {self.outcome!r} needs the deviations listed")
+        if self.outcome == "aligned" and self.deviations:
+            self.outcome = "deviates"
+        return self
+
+
+class VerificationResult(BaseModel):
+    verification: Verification
 
 
 class Interface(BaseModel):
@@ -273,8 +355,9 @@ class RoadmapResult(BaseModel):
 
 
 def validate(job_type: str, output: dict) -> Any:
-    model = {STANDARDS: StandardsResult, MODULES: ModulesResult,
-             SYSTEMS: SystemsResult, ROADMAP: RoadmapResult}[job_type]
+    model = {STANDARDS: StandardsResult, VERIFY: VerificationResult,
+             MODULES: ModulesResult, SYSTEMS: SystemsResult,
+             ROADMAP: RoadmapResult}[job_type]
     return model(**output)
 
 
@@ -323,6 +406,45 @@ def standards_input(projects: list[dict], standards: list[dict]) -> dict[str, An
         "output_format": ('{"summary": "<one paragraph>", "standards": ['
                           + _STANDARD_FORMAT + '], "evidence": [{"source_uri": '
                           '"<url>", "title": "", "source_type": ""}]}'),
+    }
+
+
+def verification_input(standard: dict) -> dict[str, Any]:
+    return {
+        "standard": {k: standard[k] for k in ("code", "name", "kind", "spec", "rationale")},
+        "instructions": (
+            "Verify this proposed interface standard for Applied Commons' modular "
+            "set before the maintainer decides on it; the aim is to build "
+            "nothing unsafe without adding needless overhead. Find the "
+            "established standards that govern this interface: international "
+            "(ISO, IEC), European (EN, and national adoptions such as DIN or "
+            "EVS-EN), Australian/New Zealand (AS/NZS), and others where relevant "
+            "(for example UL, NFPA, ASME). Prefer adopting an existing standard "
+            "outright. Cite each relevant standard (body, number, title, a link "
+            "to its catalogue or summary page, why it applies). List every way "
+            "the proposal deviates from them, with its risk (low, medium, high) "
+            "and any justification; do not hide deviations. safety_critical: "
+            "true if a fault could injure people or damage property (mains or "
+            "high current electricity, gas, pressure, heat, structures and "
+            "lifting, potable water, food contact). outcome: aligned (consistent "
+            "with the cited standards), deviates (any deviation), no-standard "
+            "(nothing applicable found), unsafe (conflicts with a safety "
+            "requirement). recommendation: approve, revise (say what in "
+            "required_controls) or reject. Full texts are often paywalled: work "
+            "from official catalogue pages, summaries and reputable secondary "
+            "sources, and say where a clause could not be checked. Be concise. "
+            + research._COMMON
+        ),
+        "output_format": (
+            '{"summary": "<one paragraph>", "verification": {"outcome": '
+            '"aligned|deviates|no-standard|unsafe", "safety_critical": false, '
+            '"references": [{"body": "IEC", "number": "IEC 60364-4-41", '
+            '"title": "", "url": "<url>", "relevance": ""}], "deviations": '
+            '[{"reference": "<standard number>", "deviation": "", "risk": '
+            '"low|medium|high", "justification": ""}], "required_controls": '
+            '[""], "recommendation": "approve|revise|reject", "rationale": ""}, '
+            '"evidence": [{"source_uri": "<url>", "title": "", "source_type": ""}]}'
+        ),
     }
 
 
