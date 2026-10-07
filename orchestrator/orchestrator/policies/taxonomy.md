@@ -33,3 +33,6 @@ above that it serves, and takes the most basic layer among them
 | Energy                         | Generation, storage and distribution of energy that essential needs depend on: off-grid and small-grid power, efficient end use, cooking and pumping energy. |
 | Communications and information | Connectivity and information systems that essential needs depend on: low-cost networks, early warning, access to health, market and technical information. |
 | Environment and climate        | Environmental systems all needs depend on: carbon removal and durable storage, ecosystem restoration, climate adaptation. Exposure to pollution and access to resources stay under Environmental stability and resource security (layer 2). |
+| Fabrication and tools          | Open machines, tools and processes that let people make and repair what essential needs depend on: workshop machines, low-cost manufacturing, repair and spare parts. |
+| Transport and logistics        | Moving people, goods, water and supplies that essential needs depend on: low-cost vehicles and carriers, last-mile delivery, supply-chain tools. |
+| Sensing and monitoring         | Measuring what essential needs depend on: low-cost sensors and test equipment for water quality, air, soil, health and infrastructure, with open data and calibration. |
