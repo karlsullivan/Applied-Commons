@@ -17,6 +17,6 @@ Applied Commons is a for-purpose engineering initiative building, testing, measu
 
 ## Public benefit and use
 
-Work is intended for public-benefit and non-commercial use. Software follows [Licence.md](Licence.md); documentation and other non-software materials follow [Licence-Docs.md](Licence-Docs.md), unless otherwise stated. Commercial use requires separate permission. Identify any project-specific or third-party licences.
+Work is primarily for the public good and is open: anyone may use, build, modify and sell it, and improvements stay open. Software follows [Licence.md](Licence.md) (GPL-3.0-or-later), hardware designs [Licence-Hardware.md](Licence-Hardware.md) (CERN-OHL-S-2.0), and documentation and other non-software materials [Licence-Docs.md](Licence-Docs.md) (CC BY-SA 4.0), unless otherwise stated. Identify any project-specific or third-party licences.
 
 Use [CONTRIBUTING.md](CONTRIBUTING.md) to contribute and [SAFETY.md](SAFETY.md) to plan and report work responsibly.

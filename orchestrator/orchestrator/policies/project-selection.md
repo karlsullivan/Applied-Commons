@@ -342,3 +342,5 @@ The published catalogue is navigable by layer, category and project, with relate
 Applied Commons is primarily for the public good. Apollo Automation (the maintainer's company) may take on projects where there is an opportunity; that does not change how work is prioritised here.
 
 A need is done when modules tested in the real world substantially solve the problem its brief describes; continuous improvement (stage 4) then closes the remaining gaps.
+
+Applied Commons' own work is open and may be used commercially: software under GPL-3.0-or-later, hardware designs under CERN-OHL-S-2.0, documentation under CC BY-SA 4.0. Modules and systems are built only on designs whose licences allow modification and commercial use; a module derived from a share-alike design (such as CC BY-SA or GPL) keeps that design's licence. Non-commercial or unlicensed projects stay in the catalogue but are not built on.

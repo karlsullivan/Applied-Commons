@@ -18,7 +18,7 @@ Applied Commons is built around a few simple principles:
 * Measure real outcomes rather than activity.
 * Design for accessibility and replication.
 * Encourage collaboration across engineering, science, research, and field practice.
-* Keep public-benefit work available for non-commercial use.
+* Keep public-benefit work open: anyone may use, build, adapt and sell it, and improvements stay open.
 * Treat commercialisation as a means to scale impact where appropriate, not as the primary objective.
 
 Progress is measured in tangibles. We measure ourselves on **experiments, designs, datasets, deployments, and verified outcomes. We are not interested in meetings, memberships, funding, or publicity.**
@@ -77,15 +77,13 @@ See `SAFETY.md` for more information.
 
 ## Licensing
 
-Applied Commons is intended to remain available for public-benefit and non-commercial use.
+Applied Commons is primarily for the public good. Its work is open: anyone may use, build, modify and sell it, including commercially, and improvements must stay open (share-alike).
 
-Software in this repository is licensed under the **PolyForm Noncommercial License 1.0.0**, unless otherwise stated.
+* Software: **GNU GPL v3 or later** ([Licence.md](Licence.md)).
+* Hardware designs: **CERN Open Hardware Licence v2, Strongly Reciprocal** ([Licence-Hardware.md](Licence-Hardware.md)).
+* Documentation and other non-software materials: **Creative Commons Attribution-ShareAlike 4.0 (CC BY-SA 4.0)** ([Licence-Docs.md](Licence-Docs.md)).
 
-Documentation and other non-software materials are intended to be made available under **Creative Commons Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0)**, unless otherwise stated.
-
-Commercial use requires separate permission.
-
-Individual projects or third-party components may use different licences. Where this occurs, the applicable licence will be identified within that project.
+Full licence texts are in [LICENSES/](LICENSES/). Unless otherwise stated, these apply to everything in this repository. Individual projects or third-party components may use different licences; where this occurs, the applicable licence is identified within that project.
 
 ## Status
 

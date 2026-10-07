@@ -15,4 +15,4 @@ Prefer a small, usable output over extra process. Keep project records beside th
 
 Only submit material you have the right to contribute. Credit sources and identify third-party licences and any exceptions clearly.
 
-Unless otherwise stated, contributed software follows [Licence.md](Licence.md) (PolyForm Noncommercial 1.0.0); documentation and other non-software materials follow [Licence-Docs.md](Licence-Docs.md) (CC BY-NC-SA 4.0). Work is intended for public-benefit and non-commercial use. Commercial use requires separate permission.
+Unless otherwise stated, contributed software follows [Licence.md](Licence.md) (GPL-3.0-or-later), hardware designs follow [Licence-Hardware.md](Licence-Hardware.md) (CERN-OHL-S-2.0), and documentation and other non-software materials follow [Licence-Docs.md](Licence-Docs.md) (CC BY-SA 4.0). By contributing you agree your contribution is released under these licences. Do not contribute material whose licence is incompatible with them (for example non-commercial material).
