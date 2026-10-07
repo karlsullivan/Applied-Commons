@@ -265,7 +265,7 @@ def test_status_endpoints_validate(client):
 # Autonomous research pipeline (rubric v1)
 # ---------------------------------------------------------------------------
 
-FOCUS_CATEGORIES = 20  # layers 1 and 2 of the needs taxonomy, plus 6 enablers
+FOCUS_CATEGORIES = 26  # layers 1 and 2 of the needs taxonomy, plus 12 enablers
 
 
 def discover(client, limit=200):
@@ -488,7 +488,7 @@ def test_portfolio_ranks_projects(client):
 def test_summary_counts_the_pipeline_and_the_queue(client):
     empty = client.get("/summary").json()
     assert empty["pipeline"]["candidates"] == 0
-    assert empty["pipeline"]["need_categories"] == 26
+    assert empty["pipeline"]["need_categories"] == 32
 
     seed_briefs()
     discover(client, limit=1)

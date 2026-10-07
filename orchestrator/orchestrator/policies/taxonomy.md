@@ -36,3 +36,9 @@ above that it serves, and takes the most basic layer among them
 | Fabrication and tools          | Open machines, tools and processes that let people make and repair what essential needs depend on: workshop machines, low-cost manufacturing, repair and spare parts. |
 | Transport and logistics        | Moving people, goods, water and supplies that essential needs depend on: low-cost vehicles and carriers, last-mile delivery, supply-chain tools. |
 | Sensing and monitoring         | Measuring what essential needs depend on: low-cost sensors and test equipment for water quality, air, soil, health and infrastructure, with open data and calibration. |
+| Skills and know-how            | Practical skills that essential needs depend on: open training and build guides, maintenance and repair knowledge, local technician programmes. |
+| Computing and open data        | Computing and data that essential needs depend on: low-power and offline-first computing, open software platforms, open datasets and data infrastructure. |
+| Cold chain and storage         | Keeping what essential needs depend on cool, dry and safe in storage: off-grid refrigeration for food and medicines, evaporative and thermal cooling, airtight grain storage. Moving goods stays under Transport and logistics. |
+| Mapping and geospatial         | Location data that essential needs depend on: open mapping, site and resource surveys, humanitarian and disaster mapping. |
+| Finance and payments           | Ways to pay for, finance and sustain what essential needs depend on: mobile money, savings groups, pay-as-you-go models, cooperative accounting tools. |
+| Materials and circularity      | Materials that essential needs depend on: local and low-cost building and manufacturing materials, recycling and reuse, low-embodied-carbon inputs. |
