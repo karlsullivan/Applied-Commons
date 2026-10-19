@@ -1244,6 +1244,18 @@ def test_the_maintainer_proposes_a_standard(client):
         "dc-bus-24v": "superseded", "dc-bus-48v": "approved"}
 
 
+def test_modules_get_an_approved_standards_whole_text(client):
+    screened(10)
+    spec = "24 V nominal DC. " + "Each branch fused to its cable. " * 60
+    r = client.post("/standards", json={**STANDARD, "spec": spec})
+    assert r.status_code == 201, r.text
+    verify_standards()
+    client.post(f"/standards/{r.json()['id']}/decision", json={"decision": "approved"})
+    discover(client)
+    [(payload,)] = sql("SELECT input FROM jobs WHERE job_type = 'module-synthesis' LIMIT 1")
+    assert payload["approved_standards"][0]["spec"] == spec and len(spec) > 1200
+
+
 def test_over_long_verification_text_is_clipped_not_rejected(client):
     screened(10)
     discover(client)

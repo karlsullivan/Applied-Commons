@@ -1325,8 +1325,9 @@ def _standards_digest(cur, approved_only=True) -> list[dict]:
     )
     digest = []
     for r in cur.fetchall():
+        # Modules are specified from an approved standard's text: all of it.
         entry = {"code": r["code"], "name": r["name"], "kind": r["kind"],
-                 "spec": _clip(r["spec"], 600)}
+                 "spec": r["spec"] if approved_only else _clip(r["spec"], 600)}
         if not approved_only:
             entry["status"] = r["status"]
             verification = _verified_for(r)
@@ -1417,7 +1418,7 @@ def _modular_set(cur, budget: int, month: str | None = None) -> list:
                 "WHERE status = 'approved' AND decided_at < NOW() - INTERVAL '7 days' "
                 "ORDER BY code")
     settled = [{"code": r["code"], "name": r["name"], "kind": r["kind"],
-                "spec": _clip(r["spec"], 1200), "approved": str(r["decided_at"])[:10],
+                "spec": r["spec"], "approved": str(r["decided_at"])[:10],
                 "adoption": adoption.get(r["code"], {"modules": 0, "systems": 0})}
                for r in cur.fetchall()]
     if settled:
