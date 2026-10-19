@@ -156,6 +156,23 @@ class Decision(BaseModel):
     note: str = Field(default="", max_length=2000)
 
 
+class StandardProposal(modular.StandardIn):
+    """A standard the maintainer proposes; ``supersedes`` names an approved
+    standard it would replace once approved."""
+    supersedes: str | None = None
+    note: str = Field(default="", max_length=2000)
+
+
+class StandardRevision(BaseModel):
+    """The maintainer's revision of a proposed standard; fields left out
+    keep their value."""
+    spec: str = Field(min_length=10, max_length=3000)
+    name: str | None = Field(default=None, min_length=3, max_length=160)
+    rationale: str | None = Field(default=None, min_length=10, max_length=2000)
+    used_by: list[str] | None = Field(default=None, max_length=20)
+    note: str = Field(default="", max_length=2000)
+
+
 class SiteIn(BaseModel):
     code: str = Field(pattern="^[a-z0-9-]{2,40}$")
     profile: dict[str, Any]
@@ -1280,15 +1297,54 @@ def _projects_digest(cur, category_id=None, limit=120, detail=False) -> list[dic
     return out
 
 
+def _verified_for(row) -> dict | None:
+    """The verification of a standard's current spec, if it has one."""
+    if row["verification"] and row["verified_hash"] == modular.spec_hash(row["spec"]):
+        return row["verification"]
+    return None
+
+
+def _held(row) -> bool:
+    """A proposed standard waiting for the maintainer, which a synthesis
+    must not rewrite: the maintainer wrote or revised it, or its current
+    spec is verified for approval."""
+    verification = _verified_for(row)
+    return row["revised_at"] is not None or bool(
+        verification and verification.get("recommendation") == "approve")
+
+
 def _standards_digest(cur, approved_only=True) -> list[dict]:
+    """Approved standards for modules; for standards-synthesis, every one
+    not rejected, a proposed one with its verification's findings when
+    they recommend revising it, so the synthesis can revise it."""
     cur.execute(
-        "SELECT code, name, kind, spec, status FROM standards "
+        "SELECT code, name, kind, spec, status, verification, verified_hash, revised_at "
+        "FROM standards "
         + ("WHERE status = 'approved' " if approved_only else "WHERE status <> 'rejected' ")
         + "ORDER BY code"
     )
-    return [{"code": r["code"], "name": r["name"], "kind": r["kind"],
-             "spec": _clip(r["spec"], 600), **({} if approved_only else {"status": r["status"]})}
-            for r in cur.fetchall()]
+    digest = []
+    for r in cur.fetchall():
+        entry = {"code": r["code"], "name": r["name"], "kind": r["kind"],
+                 "spec": _clip(r["spec"], 600)}
+        if not approved_only:
+            entry["status"] = r["status"]
+            verification = _verified_for(r)
+            if r["status"] == "proposed" and _held(r):
+                entry["held"] = True
+            elif (r["status"] == "proposed" and verification
+                  and verification.get("recommendation") == "revise"):
+                entry["spec"] = r["spec"]
+                entry["verification"] = {
+                    "recommendation": "revise",
+                    "required_controls": [_clip(c, 400) for c in
+                                          verification.get("required_controls", [])],
+                    "deviations": [{"risk": d.get("risk"),
+                                    "deviation": _clip(d.get("deviation"), 400)}
+                                   for d in verification.get("deviations", [])],
+                }
+        digest.append(entry)
+    return digest
 
 
 def _modules_digest(cur, limit=150) -> list[dict]:
@@ -1463,7 +1519,8 @@ def _adoption(cur) -> dict[str, dict]:
 def _upsert_standard(cur, job_id, s, supersedes: str | None = None) -> str:
     """Insert a proposed standard, or refresh one still proposed; a
     decided standard (approved, rejected or superseded) is never
-    overwritten. ``supersedes`` names the approved standard a revision
+    overwritten, nor is a held one (see ``_held``: the SQL below is the
+    same test). ``supersedes`` names the approved standard a revision
     would replace."""
     cur.execute(
         """
@@ -1475,7 +1532,10 @@ def _upsert_standard(cur, job_id, s, supersedes: str | None = None) -> str:
             job_id = EXCLUDED.job_id,
             supersedes = COALESCE(EXCLUDED.supersedes, standards.supersedes),
             updated_at = NOW()
-        WHERE standards.status = 'proposed'
+        WHERE standards.status = 'proposed' AND standards.revised_at IS NULL
+          AND NOT COALESCE(standards.verification->>'recommendation' = 'approve'
+                           AND standards.verified_hash = left(encode(sha256(
+                               convert_to(standards.spec, 'UTF8')), 'hex'), 16), false)
         RETURNING status
         """,
         (s.code, s.name, s.kind, s.spec, s.rationale, Jsonb(s.used_by), job_id, supersedes),
@@ -1794,7 +1854,7 @@ def get_standards():
                 SELECT s.id, s.code, s.name, s.kind, s.spec, s.rationale, s.used_by,
                        s.status, s.decision_note, s.decided_at, s.verification,
                        s.verified_hash, s.verified_at, s.created_at, s.updated_at,
-                       s.supersedes,
+                       s.supersedes, s.revised_at, s.revision_note, s.history,
                        (SELECT n.code FROM standards n WHERE n.supersedes = s.code
                         AND n.status <> 'rejected' ORDER BY n.id DESC LIMIT 1) AS superseded_by,
                        (SELECT to_jsonb(r) - 'standard_id' - 'job_id' FROM standard_reviews r
@@ -1810,6 +1870,73 @@ def get_standards():
         row["adoption"] = adoption.get(row["code"], {"modules": 0, "module_codes": [],
                                                      "systems": 0})
     return rows
+
+
+@app.post("/standards", status_code=201)
+def propose_standard(item: StandardProposal):
+    """The maintainer proposes a standard (one a synthesis missed, or a
+    revision of an approved one under a new code). It is verified and
+    decided like any other, and no synthesis rewrites it."""
+    with db() as conn:
+        with conn.cursor() as cur:
+            if item.supersedes:
+                cur.execute("SELECT 1 FROM standards WHERE code = %s AND status = 'approved'",
+                            (item.supersedes,))
+                if cur.fetchone() is None:
+                    raise HTTPException(status_code=409,
+                                        detail="supersedes must name an approved standard")
+            cur.execute(
+                "INSERT INTO standards (code, name, kind, spec, rationale, used_by, "
+                "supersedes, revised_at, revision_note) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, NOW(), %s) "
+                "ON CONFLICT (code) DO NOTHING RETURNING id, code, status",
+                (item.code, item.name, item.kind, item.spec, item.rationale,
+                 Jsonb(item.used_by), item.supersedes, item.note or None),
+            )
+            row = cur.fetchone()
+        conn.commit()
+    if row is None:
+        raise HTTPException(status_code=409, detail="a standard with this code exists")
+    return row
+
+
+@app.post("/standards/{standard_id}/revision")
+def revise_standard(standard_id: int, item: StandardRevision):
+    """The maintainer revises a proposed standard in place, for example to
+    meet its verification's required controls. The earlier version and its
+    verification go to history; the new spec is verified before it can be
+    approved, and no synthesis rewrites it. A decided standard changes only
+    through a new proposal that supersedes it."""
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT status, name, spec, rationale, used_by, verification, "
+                        "verified_at, revision_note FROM standards WHERE id = %s FOR UPDATE",
+                        (standard_id,))
+            row = cur.fetchone()
+            if row is None:
+                raise HTTPException(status_code=404, detail="not found")
+            if row["status"] != "proposed":
+                raise HTTPException(status_code=409, detail=(
+                    f"standard is {row['status']}: propose a revision under a new code "
+                    "(POST /standards with supersedes)"))
+            earlier = {"name": row["name"], "spec": row["spec"], "rationale": row["rationale"],
+                       "used_by": row["used_by"], "verification": row["verification"],
+                       "verified_at": str(row["verified_at"]) if row["verified_at"] else None,
+                       "note": row["revision_note"], "replaced_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+            used_by = None if item.used_by is None else [str(u)[:200] for u in item.used_by]
+            cur.execute(
+                "UPDATE standards SET spec = %s, name = COALESCE(%s, name), "
+                "rationale = COALESCE(%s, rationale), used_by = COALESCE(%s, used_by), "
+                "verification = NULL, verified_hash = NULL, verified_at = NULL, "
+                "history = history || %s, revised_at = NOW(), revision_note = %s, "
+                "updated_at = NOW() WHERE id = %s RETURNING id, code, status",
+                (item.spec, item.name, item.rationale,
+                 None if used_by is None else Jsonb(used_by), Jsonb([earlier]),
+                 item.note or None, standard_id),
+            )
+            result = cur.fetchone()
+        conn.commit()
+    return result
 
 
 def _decide_on(table: str, item_id: int, item: Decision) -> dict:

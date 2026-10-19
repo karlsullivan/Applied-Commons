@@ -141,7 +141,23 @@ class StandardsResult(BaseModel):
     standards: list[StandardIn] = Field(max_length=10)
 
 
-class Reference(BaseModel):
+class _Clipped(BaseModel):
+    """Text or lists over their limit are cut, not rejected: one over-long
+    note should not throw away a whole verification (two were lost to a
+    reference note over 600 characters, October 2026)."""
+
+    @field_validator("*", mode="before")
+    @classmethod
+    def _clip(cls, value, info):
+        if isinstance(value, (str, list)):
+            for meta in cls.model_fields[info.field_name].metadata:
+                limit = getattr(meta, "max_length", None)
+                if limit is not None:
+                    return value[:limit]
+        return value
+
+
+class Reference(_Clipped):
     body: str = Field(default="", max_length=40)
     number: str = Field(min_length=1, max_length=80)
     title: str = Field(default="", max_length=300)
@@ -154,7 +170,7 @@ class Reference(BaseModel):
         return research._check_url(value)
 
 
-class Deviation(BaseModel):
+class Deviation(_Clipped):
     reference: str = Field(default="", max_length=120)
     deviation: str = Field(min_length=5, max_length=1500)
     risk: str = "medium"
@@ -166,7 +182,7 @@ class Deviation(BaseModel):
         return _choice(value, RISKS, "medium")
 
 
-class Verification(BaseModel):
+class Verification(_Clipped):
     outcome: str
     safety_critical: bool
     references: list[Reference] = Field(default_factory=list, max_length=15)
@@ -447,8 +463,13 @@ def standards_input(projects: list[dict], standards: list[dict]) -> dict[str, An
             "software (APIs, data schemas). Prefer existing open or widely used "
             "standards (ISO, IEC, common parts) that are cheap and available "
             "worldwide. Do not repeat existing_standards; fill gaps or propose "
-            "a revision under a new code. The maintainer approves each one "
-            "before modules use it. " + research._COMMON
+            "a revision under a new code. One exception: a proposed standard "
+            "that carries a verification recommending revise (and is not held) "
+            "is returned under its own code with its spec revised to meet the "
+            "verification's required_controls and deviations; it is verified "
+            "again. A held standard waits for the maintainer: leave it out. "
+            "The maintainer approves each one before modules use it. "
+            + research._COMMON
         ),
         "output_format": ('{"summary": "<one paragraph>", "standards": ['
                           + _STANDARD_FORMAT + '], "evidence": [{"source_uri": '

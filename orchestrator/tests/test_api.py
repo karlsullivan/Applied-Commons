@@ -1118,12 +1118,17 @@ def test_standards_are_verified_before_they_can_be_approved(client):
     assert r.status_code == 200 and r.json()["status"] == "approved"
 
 
+REVISE = {**VERIFIED, "verification": {
+    **VERIFIED["verification"], "recommendation": "revise",
+    "required_controls": ["Name the connector standard."]}}
+
+
 def test_a_revised_proposal_is_verified_again(client):
     screened(10)
     discover(client)
     run_job(client, "standards-synthesis", {"summary": "s", "standards": [STANDARD]})
     discover(client)
-    run_job(client, "standard-verification", VERIFIED)
+    run_job(client, "standard-verification", REVISE)
     # A later proposal revises the still-proposed standard's spec.
     job_id = client.post("/jobs", json={"project_id": project(client, code="JOB-HOLDER"),
                                         "job_type": "standards-synthesis", "input": {}}).json()["id"]
@@ -1137,6 +1142,122 @@ def test_a_revised_proposal_is_verified_again(client):
     # Rejecting needs no verification.
     r = client.post(f"/standards/{standard['id']}/decision", json={"decision": "rejected"})
     assert r.status_code == 200
+
+
+def rerun_synthesis(client, standards):
+    """Complete a later standards-synthesis job with these standards."""
+    job_id = client.post("/jobs", json={"project_id": project(client, code="JOB-HOLDER"),
+                                        "job_type": "standards-synthesis", "input": {}}).json()["id"]
+    claim(client, APOLLO, ["standards-synthesis"])
+    r = client.post(f"/jobs/{job_id}/complete", json={"worker": APOLLO, "output": {
+        "summary": "s", "standards": standards}})
+    assert r.status_code == 200, r.text
+
+
+def test_synthesis_gets_the_findings_of_a_revise_verification(client):
+    import modular
+
+    screened(10)
+    discover(client)
+    run_job(client, "standards-synthesis", {"summary": "s", "standards": [
+        STANDARD, {**STANDARD, "code": "lora-node", "name": "LoRa sensor node"}]})
+    discover(client)
+    run_job(client, "standard-verification", REVISE)
+    run_job(client, "standard-verification", VERIFIED)
+    sql("UPDATE jobs SET unit_key = 'last-month' WHERE job_type = 'standards-synthesis'")
+    discover(client)
+    [(payload,)] = sql("SELECT input FROM jobs WHERE job_type = 'standards-synthesis' "
+                       "AND status = 'queued'")
+    entries = {s["code"]: s for s in payload["existing_standards"]}
+    revise = [e for e in entries.values() if "verification" in e]
+    held = [e for e in entries.values() if e.get("held")]
+    assert len(revise) == 1 and len(held) == 1
+    assert revise[0]["verification"]["required_controls"] == ["Name the connector standard."]
+    assert revise[0]["verification"]["deviations"][0]["risk"] == "low"
+    assert "required_controls" in payload["instructions"]
+    # The one verified for approval is held: a synthesis does not rewrite it.
+    _, r = run_job(client, "standards-synthesis", {"summary": "s", "standards": [
+        {**STANDARD, "code": held[0]["code"], "spec": "48 V nominal DC."},
+        {**STANDARD, "code": revise[0]["code"], "spec": "24 V nominal DC, XT60 (IEC 61984)."}]})
+    assert r.status_code == 200, r.text
+    after = {s["code"]: s for s in client.get("/standards").json()}
+    assert after[held[0]["code"]]["spec"] == held[0]["spec"]
+    assert after[held[0]["code"]]["verified"] is True
+    assert after[revise[0]["code"]]["spec"].endswith("(IEC 61984).")
+    assert modular.spec_hash(after[revise[0]["code"]]["spec"]) != modular.spec_hash(STANDARD["spec"])
+
+
+def test_the_maintainer_revises_a_proposed_standard(client):
+    screened(10)
+    discover(client)
+    run_job(client, "standards-synthesis", {"summary": "s", "standards": [STANDARD]})
+    discover(client)
+    run_job(client, "standard-verification", REVISE)
+    [standard] = client.get("/standards").json()
+    r = client.post(f"/standards/{standard['id']}/revision", json={
+        "spec": "24 V nominal DC, XT60 to IEC 61984, 20 A fuse per branch.",
+        "note": "Meets the verification's controls."})
+    assert r.status_code == 200, r.text
+    [revised] = client.get("/standards").json()
+    assert revised["spec"].startswith("24 V nominal DC, XT60 to")
+    assert revised["name"] == standard["name"] and revised["rationale"] == standard["rationale"]
+    assert revised["verification"] is None and revised["verified"] is False
+    assert revised["revised_at"] and revised["revision_note"] == "Meets the verification's controls."
+    [earlier] = revised["history"]
+    assert earlier["spec"] == standard["spec"]
+    assert earlier["verification"]["recommendation"] == "revise"
+    # Verified again before it can be approved; a synthesis leaves it alone.
+    assert client.post(f"/standards/{standard['id']}/decision",
+                       json={"decision": "approved"}).status_code == 409
+    jobs = [j for j in discover(client)["modular"] if j["job_type"] == "standard-verification"]
+    assert len(jobs) == 1
+    rerun_synthesis(client, [{**STANDARD, "spec": "12 V nominal DC instead."}])
+    assert client.get("/standards").json()[0]["spec"].startswith("24 V nominal DC, XT60 to")
+    run_job(client, "standard-verification", VERIFIED)
+    assert client.post(f"/standards/{standard['id']}/decision",
+                       json={"decision": "approved"}).status_code == 200
+    # A decided standard is not revised in place.
+    r = client.post(f"/standards/{standard['id']}/revision", json={"spec": "48 V nominal DC."})
+    assert r.status_code == 409 and "supersedes" in r.json()["detail"]
+    assert client.post("/standards/999/revision", json={"spec": "48 V nominal DC."}).status_code == 404
+
+
+def test_the_maintainer_proposes_a_standard(client):
+    r = client.post("/standards", json={**STANDARD, "note": "No DC bus proposed yet."})
+    assert r.status_code == 201, r.text
+    assert r.json()["code"] == "dc-bus-24v" and r.json()["status"] == "proposed"
+    assert client.post("/standards", json=STANDARD).status_code == 409  # code taken
+    r = client.post("/standards", json={**STANDARD, "code": "dc-bus-48v", "supersedes": "dc-bus-24v"})
+    assert r.status_code == 409  # supersedes only an approved standard
+    [standard] = client.get("/standards").json()
+    assert standard["revised_at"] and standard["revision_note"] == "No DC bus proposed yet."
+    # Verified like any other, then a maintainer revision under a new code
+    # supersedes it once approved.
+    verify_standards()
+    client.post(f"/standards/{standard['id']}/decision", json={"decision": "approved"})
+    r = client.post("/standards", json={**STANDARD, "code": "dc-bus-48v", "name": "48 V DC bus",
+                                        "spec": "48 V nominal DC, XT90.", "supersedes": "dc-bus-24v"})
+    assert r.status_code == 201, r.text
+    verify_standards()
+    client.post(f"/standards/{r.json()['id']}/decision", json={"decision": "approved"})
+    assert {s["code"]: s["status"] for s in client.get("/standards").json()} == {
+        "dc-bus-24v": "superseded", "dc-bus-48v": "approved"}
+
+
+def test_over_long_verification_text_is_clipped_not_rejected(client):
+    screened(10)
+    discover(client)
+    run_job(client, "standards-synthesis", {"summary": "s", "standards": [STANDARD]})
+    discover(client)
+    long = {**VERIFIED["verification"]}
+    long["references"] = [{**long["references"][0], "relevance": "x" * 900}] * 20
+    long["deviations"] = [{**long["deviations"][0], "justification": "y" * 2000}]
+    _, r = run_job(client, "standard-verification", {"summary": "s", "verification": long})
+    assert r.status_code == 200, r.text
+    [standard] = client.get("/standards").json()
+    references = standard["verification"]["references"]
+    assert len(references) == 15 and len(references[0]["relevance"]) == 600
+    assert len(standard["verification"]["deviations"][0]["justification"]) == 1500
 
 
 @pytest.mark.parametrize("change", [
