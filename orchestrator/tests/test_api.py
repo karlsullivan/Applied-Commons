@@ -1453,6 +1453,37 @@ def test_progress_is_tracked_when_what_meets_a_need_changes(client):
     assert len(discover(client)["progress"]) == 1
 
 
+def test_one_waiting_progress_job_per_need_is_refreshed(client):
+    cid = water_progress_setup()
+    [job] = discover(client)["progress"]
+    # Duplicates queued before this rule, behind the first one.
+    for n in (1, 2):
+        sql("INSERT INTO jobs (job_type, worker, status, priority, unit_key, input, created_at) "
+            "SELECT job_type, worker, status, priority, unit_key || ':dup' || %s, input, "
+            "created_at + make_interval(secs => %s) FROM jobs WHERE id = %s", str(n), n, job["id"])
+    screened(1, prefix="Q")  # what could meet the need changed
+    assert discover(client)["progress"] == []  # refreshed, not added
+    [(jid, key, payload)] = sql("SELECT id, unit_key, input FROM jobs "
+                                "WHERE job_type = 'need-progress'")
+    assert jid == job["id"] and key != job["unit_key"] and key.startswith(f"need-progress:{cid}:")
+    assert len(payload["projects"]) == 3
+    assert discover(client)["progress"] == []  # unchanged now
+
+
+def test_waiting_jobs_gain_priority_with_age(client):
+    pid = project(client)
+    old, new, urgent = (job(client, project_id=pid) for _ in range(3))
+    sql("UPDATE jobs SET priority = 0.53, created_at = NOW() - INTERVAL '12 days' WHERE id = %s", old)
+    sql("UPDATE jobs SET priority = 0.64 WHERE id = %s", new)
+    sql("UPDATE jobs SET priority = 0.90 WHERE id = %s", urgent)
+    order = [claim(client, APOLLO, ["literature-collection"]).json()["job"]["id"] for _ in range(3)]
+    assert order == [urgent, old, new]
+    # The boost is capped: a month-old low-priority job stays behind fresh urgent work.
+    sql("UPDATE jobs SET status = 'queued', created_at = NOW() - INTERVAL '30 days' WHERE id = %s", old)
+    sql("UPDATE jobs SET status = 'queued', created_at = NOW() WHERE id = %s", urgent)
+    assert claim(client, APOLLO, ["literature-collection"]).json()["job"]["id"] == urgent
+
+
 def test_progress_levels_are_capped_by_the_records(client):
     cid = water_progress_setup()
     discover(client)

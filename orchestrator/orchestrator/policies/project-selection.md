@@ -225,7 +225,7 @@ Every project's sources are checked automatically, without a model (ops/checks/c
 
 4h. Progress towards done
 
-A need is done when modules tested in the real world substantially solve it (section 9). Progress is tracked against the requirements in its brief. A need-progress job matches each requirement to the projects, modules and systems that meet it, at one of five levels: none; candidate (a screened project claims it); documented (a project with a complete build pack under an open or share-alike licence meets it); designed (a module or system of the modular set meets it); field-tested (a module tested in the real world meets it). The orchestrator lowers any level the records do not support, so a model cannot overstate progress. A need's status is its weakest requirement's level. Only the maintainer marks a need substantially solved, and only once at least one requirement is field-tested; continuous improvement (stage 4) then closes the remaining gaps. The job runs when what could meet a need changes, at most weekly per need.
+A need is done when modules tested in the real world substantially solve it (section 9). Progress is tracked against the requirements in its brief. A need-progress job matches each requirement to the projects, modules and systems that meet it, at one of five levels: none; candidate (a screened project claims it); documented (a project with a complete build pack under an open or share-alike licence meets it); designed (a module or system of the modular set meets it); field-tested (a module tested in the real world meets it). The orchestrator lowers any level the records do not support, so a model cannot overstate progress. A need's status is its weakest requirement's level. Only the maintainer marks a need substantially solved, and only once at least one requirement is field-tested; continuous improvement (stage 4) then closes the remaining gaps. The job runs when what could meet a need changes, at most weekly per need; while one is waiting to run, a change refreshes it rather than queuing another.
 
 4i. Safety review of build packs
 
@@ -266,6 +266,8 @@ Model agreement and repeated generation may help identify questions, but do not 
 7. Compute allocation and continuation
 
 PlantScope has first priority on the Spark. Applied Commons uses available capacity and must yield the compute and memory PlantScope requires. Preserve completed steps, evidence and the next intended action when interrupted. Resume from saved progress when capacity returns; an interrupted step may need to be rerun.
+
+Within Applied Commons, jobs run in priority order, and a waiting job gains 0.01 priority per day it waits, up to 0.15 (maintainer decision 2026-10-19), so lower-priority work such as need progress, discovery and literature collection is not starved by a steady flow of higher-priority jobs, while a fresh verification or module job still goes first.
 
 Resource allowances are planning and review points. A full day or longer of available compute is acceptable when supported by a concrete investigation and a credible path to useful evidence or a better engineering result. Elapsed time or token consumption alone is not a reason to abandon a worthwhile project.
 

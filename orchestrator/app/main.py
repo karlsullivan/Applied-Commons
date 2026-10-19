@@ -1107,6 +1107,27 @@ def _track_progress(cur, budget: int) -> list:
              [(m["code"], m["maturity"]) for m in modules], [s["code"] for s in systems]],
             sort_keys=True))
         key = f"{research.PROGRESS}:{category['id']}:{fingerprint}"
+        payload = {"category_id": category["id"],
+                   **research.progress_input(category, brief["brief"].get("requirements") or [],
+                                             projects, modules, systems)}
+        # One waiting job per need: a change refreshes the oldest waiting
+        # job (keeping its age) rather than queuing another beside it.
+        cur.execute("SELECT id, unit_key FROM jobs WHERE job_type = %s AND status = 'queued' "
+                    "AND input->>'category_id' = %s ORDER BY created_at, id",
+                    (research.PROGRESS, str(category["id"])))
+        waiting = cur.fetchall()
+        if waiting:
+            if len(waiting) > 1:
+                cur.execute("DELETE FROM jobs WHERE id = ANY(%s)",
+                            ([w["id"] for w in waiting[1:]],))
+            if waiting[0]["unit_key"] == key:
+                continue
+            if _unit_exists(cur, key):  # this state was already assessed
+                cur.execute("DELETE FROM jobs WHERE id = %s", (waiting[0]["id"],))
+            else:
+                cur.execute("UPDATE jobs SET unit_key = %s, input = %s WHERE id = %s",
+                            (key, Jsonb(payload), waiting[0]["id"]))
+            continue
         if _unit_exists(cur, key):
             continue
         cur.execute("SELECT 1 FROM jobs WHERE job_type = %s AND input->>'category_id' = %s "
@@ -1115,11 +1136,7 @@ def _track_progress(cur, budget: int) -> list:
         if cur.fetchone():
             continue
         job = _enqueue(cur, unit_key=key, job_type=research.PROGRESS,
-                       priority=research.PROGRESS_PRIORITY,
-                       payload={"category_id": category["id"],
-                                **research.progress_input(category,
-                                                          brief["brief"].get("requirements") or [],
-                                                          projects, modules, systems)})
+                       priority=research.PROGRESS_PRIORITY, payload=payload)
         if job:
             created.append(job)
     return created
@@ -2324,6 +2341,14 @@ def create_job(item: JobCreate):
 # Job claiming
 # ---------------------------------------------------------------------------
 
+#: A waiting job gains priority with age, so lower-priority work (need
+#: progress, discovery, literature) is not starved by a steady flow of
+#: higher-priority jobs (maintainer decision 2026-10-19). Capped, so a
+#: fresh verification or module job still goes first.
+AGING_PER_DAY = 0.01
+AGING_MAX = 0.15
+
+
 @app.post("/jobs/claim")
 def claim_job(item: JobClaim):
     if not item.job_types:
@@ -2366,7 +2391,9 @@ def claim_job(item: JobClaim):
                             )
                           )
                     ORDER BY
-                        priority DESC,
+                        priority + LEAST(
+                            EXTRACT(EPOCH FROM NOW() - created_at) / 86400 * %s, %s
+                        ) DESC,
                         created_at ASC
                     FOR UPDATE SKIP LOCKED
                     LIMIT 1
@@ -2386,6 +2413,8 @@ def claim_job(item: JobClaim):
                 (
                     item.job_types,
                     item.worker,
+                    AGING_PER_DAY,
+                    AGING_MAX,
                     item.worker,
                 ),
             )
