@@ -1274,6 +1274,61 @@ def test_modules_see_pending_and_rejected_standards(client):
     assert "pending_standards" in payload["instructions"]
 
 
+def test_the_maintainer_supplies_a_verification(client):
+    import modular
+
+    screened(10)
+    discover(client)
+    run_job(client, "standards-synthesis", {"summary": "s", "standards": [STANDARD]})
+    discover(client)  # a verification job is queued
+    [standard] = client.get("/standards").json()
+    body = {"verification": VERIFIED["verification"], "verified_by": "Claude Code for the maintainer",
+            "spec_hash": modular.spec_hash(standard["spec"])}
+    r = client.post(f"/standards/{standard['id']}/verification", json=body)
+    assert r.status_code == 200, r.text
+    assert r.json()["removed_jobs"] == 1
+    assert sql("SELECT count(*) FROM jobs WHERE job_type = 'standard-verification'") == [(0,)]
+    [standard] = client.get("/standards").json()
+    assert standard["verified"] is True
+    assert standard["verification"]["verified_by"] == "Claude Code for the maintainer"
+    assert standard["verification"]["deviations"][0]["risk"] == "low"
+    assert discover(client)["modular"] == [] or all(
+        j["job_type"] != "standard-verification" for j in discover(client)["modular"])
+    assert client.post(f"/standards/{standard['id']}/decision",
+                       json={"decision": "approved"}).status_code == 200
+    # Refused for a spec that has changed, or while a verification job runs.
+    assert client.post(f"/standards/{standard['id']}/verification",
+                       json={**body, "spec_hash": "0" * 16}).status_code == 409
+    client.post("/standards", json={**STANDARD, "code": "pipe-32"})
+    discover(client)
+    claimed = claim(client, APOLLO, ["standard-verification"]).json()["job"]
+    pipe = next(s for s in client.get("/standards").json() if s["code"] == "pipe-32")
+    assert claimed["input"]["standard_id"] == pipe["id"]
+    r = client.post(f"/standards/{pipe['id']}/verification",
+                    json={**body, "spec_hash": modular.spec_hash(pipe["spec"])})
+    assert r.status_code == 409 and "running" in r.json()["detail"]
+    assert client.post("/standards/999/verification", json=body).status_code == 404
+
+
+def test_one_waiting_discovery_scan_per_category(client):
+    from psycopg.types.json import Jsonb
+
+    cid = water_progress_setup()
+    sql("UPDATE jobs SET status = 'completed' WHERE job_type <> 'candidate-discovery'")
+    queued = [j for j in discover(client)["discovery"]]
+    [first] = [j for j in queued if j["unit_key"].startswith(f"candidate-discovery:category:{cid}:")]
+    # A duplicate from an earlier period, then a new period while it waits.
+    sql("INSERT INTO jobs (job_type, worker, status, priority, unit_key, input, created_at) "
+        "VALUES ('candidate-discovery', 'unassigned', 'queued', 0.6, 'old-period', %s, "
+        "NOW() + INTERVAL '1 second')", Jsonb({"category_id": cid}))
+    sql("UPDATE jobs SET unit_key = 'older-period' WHERE id = %s", first["id"])
+    assert all(not j["unit_key"].startswith(f"candidate-discovery:category:{cid}:")
+               for j in discover(client)["discovery"])
+    rows = sql("SELECT id FROM jobs WHERE job_type = 'candidate-discovery' AND status = 'queued' "
+               "AND input->>'category_id' = %s", str(cid))
+    assert rows == [(first["id"],)]
+
+
 def test_over_long_verification_text_is_clipped_not_rejected(client):
     screened(10)
     discover(client)

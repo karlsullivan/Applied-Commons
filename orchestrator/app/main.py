@@ -163,6 +163,14 @@ class StandardProposal(modular.StandardIn):
     note: str = Field(default="", max_length=2000)
 
 
+class MaintainerVerification(BaseModel):
+    """A verification the maintainer supplies instead of waiting for a
+    standard-verification job; ``spec_hash`` is the spec it checked."""
+    verification: modular.Verification
+    verified_by: str = Field(min_length=3, max_length=200)
+    spec_hash: str = Field(min_length=16, max_length=16)
+
+
 class StandardRevision(BaseModel):
     """The maintainer's revision of a proposed standard; fields left out
     keep their value."""
@@ -495,6 +503,17 @@ def _discover_candidates(cur, budget: int) -> list:
             break
         key = f"{research.DISCOVERY}:category:{category['id']}:{period}"
         if _unit_exists(cur, key):
+            continue
+        # One waiting scan per category: a new period does not queue a
+        # second beside one that has not run yet (duplicates queued before
+        # this rule are folded into the oldest).
+        cur.execute("SELECT id FROM jobs WHERE job_type = %s AND status = 'queued' "
+                    "AND input->>'category_id' = %s ORDER BY created_at, id",
+                    (research.DISCOVERY, str(category["id"])))
+        waiting = [r["id"] for r in cur.fetchall()]
+        if waiting:
+            if len(waiting) > 1:
+                cur.execute("DELETE FROM jobs WHERE id = ANY(%s)", (waiting[1:],))
             continue
         brief = _latest_brief(cur, category["id"])
         if brief is None:
@@ -1966,6 +1985,43 @@ def revise_standard(standard_id: int, item: StandardRevision):
             result = cur.fetchone()
         conn.commit()
     return result
+
+
+@app.post("/standards/{standard_id}/verification")
+def verify_standard(standard_id: int, item: MaintainerVerification):
+    """Record a verification the maintainer supplies (for example, done by
+    an assistant with more capacity than the research worker), against the
+    spec it checked. ``verified_by`` is kept with it, and the standard's
+    queued verification jobs are removed. Refused while a verification job
+    is running for the standard, or if the spec has changed since."""
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT status, spec FROM standards WHERE id = %s FOR UPDATE",
+                        (standard_id,))
+            row = cur.fetchone()
+            if row is None:
+                raise HTTPException(status_code=404, detail="not found")
+            if row["status"] not in ("proposed", "approved"):
+                raise HTTPException(status_code=409, detail=f"standard is {row['status']}")
+            if item.spec_hash != modular.spec_hash(row["spec"]):
+                raise HTTPException(status_code=409,
+                                    detail="the spec has changed since it was verified")
+            cur.execute("SELECT 1 FROM jobs WHERE job_type = %s AND status = 'running' "
+                        "AND input->>'standard_id' = %s", (modular.VERIFY, str(standard_id)))
+            if cur.fetchone():
+                raise HTTPException(status_code=409,
+                                    detail="a verification job is running for this standard")
+            verification = {**item.verification.model_dump(), "verified_by": item.verified_by}
+            cur.execute("UPDATE standards SET verification = %s, verified_hash = %s, "
+                        "verified_at = NOW() WHERE id = %s",
+                        (Jsonb(verification), item.spec_hash, standard_id))
+            cur.execute("DELETE FROM jobs WHERE job_type = %s AND status = 'queued' "
+                        "AND input->>'standard_id' = %s RETURNING id",
+                        (modular.VERIFY, str(standard_id)))
+            removed = len(cur.fetchall())
+        conn.commit()
+    return {"id": standard_id, "verified": True, "outcome": item.verification.outcome,
+            "removed_jobs": removed}
 
 
 def _decide_on(table: str, item_id: int, item: Decision) -> dict:
