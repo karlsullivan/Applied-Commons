@@ -4,6 +4,7 @@ import time
 from datetime import datetime
 from typing import Any
 
+import audit
 import modular
 import research
 
@@ -34,6 +35,7 @@ DEFAULT_JOB_TYPE_OWNERS = {
     "need-progress": "apollo-hermes",
     "standards-review": "apollo-hermes",
     "safety-review": "apollo-hermes",
+    "catalogue-audit": "apollo-hermes",
     "candidate-assessment": "apollo-hermes",
     "literature-collection": "apollo-hermes",
     "source-summarisation": "apollo-hermes",
@@ -506,10 +508,13 @@ def _discover_candidates(cur, budget: int) -> list:
             continue
         # One waiting scan per category: a new period does not queue a
         # second beside one that has not run yet (duplicates queued before
-        # this rule are folded into the oldest).
+        # this rule are folded into the oldest). Scans the maintainer asked
+        # for on an audit gap are separate and never folded.
         cur.execute("SELECT id FROM jobs WHERE job_type = %s AND status = 'queued' "
-                    "AND input->>'category_id' = %s ORDER BY created_at, id",
-                    (research.DISCOVERY, str(category["id"])))
+                    "AND input->>'category_id' = %s AND unit_key LIKE %s "
+                    "ORDER BY created_at, id",
+                    (research.DISCOVERY, str(category["id"]),
+                     f"{research.DISCOVERY}:category:%"))
         waiting = [r["id"] for r in cur.fetchall()]
         if waiting:
             if len(waiting) > 1:
@@ -871,7 +876,9 @@ def discover_backlog(item: BacklogDiscover):
     10. progress: a need-progress job per briefed need when what could meet
        it changes, at most weekly (section 4h);
     11. safety: a safety-review of each completed build pack, again when
-       it changes (section 4i).
+       it changes (section 4i);
+    12. audit: a catalogue-audit job each month, listing gaps against
+       reference lists for the maintainer to act on or ignore (section 4j).
 
     Every job carries a stable unit key, so repeated runs never enqueue the
     same unit twice; completed or failed units are not re-enqueued. Topics
@@ -892,6 +899,7 @@ def discover_backlog(item: BacklogDiscover):
             relations = _relate_projects(cur)
             progress = _track_progress(cur, item.limit)
             safety = _review_safety(cur, item.limit)
+            audited = _audit_catalogue(cur)
         conn.commit()
     return {
         "steered": steered,
@@ -907,6 +915,7 @@ def discover_backlog(item: BacklogDiscover):
         "relations": relations,
         "progress": progress,
         "safety": safety,
+        "audit": audited,
     }
 
 
@@ -2405,6 +2414,158 @@ def create_job(item: JobCreate):
 
 
 # ---------------------------------------------------------------------------
+# Monthly catalogue audit and gap analysis (policy section 4j; audit.py)
+# ---------------------------------------------------------------------------
+
+
+def _audit_catalogue(cur, month: str | None = None) -> list:
+    """One catalogue-audit job a month, once enough projects are screened."""
+    month = month or modular.month()
+    key = f"{audit.AUDIT}:{month}"
+    cur.execute("SELECT count(DISTINCT project_id) AS n FROM assessments")
+    if cur.fetchone()["n"] < audit.MIN_ASSESSED or _unit_exists(cur, key):
+        return []
+    cur.execute(
+        """
+        SELECT c.id, c.layer, c.name, COALESCE(c.track, 'need') AS track, c.solved_at,
+               COALESCE(c.layer = ANY(%s) OR c.track = %s, FALSE) AS focus,
+               b.brief, g.requirements AS progress
+        FROM need_categories c
+        LEFT JOIN LATERAL (SELECT brief FROM need_briefs WHERE category_id = c.id
+                           ORDER BY created_at DESC, id DESC LIMIT 1) b ON TRUE
+        LEFT JOIN LATERAL (SELECT requirements FROM need_progress WHERE category_id = c.id
+                           ORDER BY created_at DESC, id DESC LIMIT 1) g ON TRUE
+        ORDER BY c.layer NULLS LAST, c.name
+        """,
+        (list(research.DISCOVERY_LAYERS), research.ENABLER),
+    )
+    rows = cur.fetchall()
+    cur.execute("SELECT category_id, status, count(*) AS n FROM projects GROUP BY 1, 2")
+    counts: dict = {}
+    for r in cur.fetchall():
+        counts.setdefault(r["category_id"], {})[r["status"]] = r["n"]
+    categories = [{
+        "name": r["name"], "layer": r["layer"], "track": r["track"], "in_focus": r["focus"],
+        "requirements": [_clip(t, 120) for t in ((r["brief"] or {}).get("requirements")
+                                                 or [])[:6]],
+        "status": _need_status(r["solved_at"], r["progress"]),
+        "levels": [p.get("level") for p in r["progress"] or []],
+        "projects": counts.get(r["id"], {}),
+    } for r in rows]
+    projects = [{"name": p["name"], "category": p["category"], "status": p["status"],
+                 "licence_class": p["licence_class"], "summary": _clip(p["summary"], 100)}
+                for p in _projects_digest(cur, limit=250)]
+    cur.execute("SELECT code, name, status FROM standards WHERE status <> 'rejected' "
+                "ORDER BY code")
+    standards = cur.fetchall()
+    cur.execute("SELECT code, name, domain FROM modules ORDER BY domain, code")
+    modules = cur.fetchall()
+    cur.execute("SELECT id, title, category_name AS category, action, status FROM audit_gaps "
+                "WHERE status <> 'closed' ORDER BY id")
+    gaps = cur.fetchall()
+    job = _enqueue(cur, unit_key=key, job_type=audit.AUDIT, priority=audit.AUDIT_PRIORITY,
+                   payload=audit.audit_input(categories, projects, standards, modules, gaps))
+    return [job] if job else []
+
+
+def _store_audit(cur, job, result, summary: str) -> dict:
+    """Record the month's audit and its gaps (each matched to its category
+    by name where it names an existing one), and close the earlier gaps the
+    audit found covered."""
+    month = (job.get("unit_key") or "").rsplit(":", 1)[-1] or modular.month()
+    cur.execute("INSERT INTO catalogue_audits (month, summary, job_id) VALUES (%s, %s, %s) "
+                "RETURNING id", (month, _clip(summary, 3000), job["id"]))
+    audit_id = cur.fetchone()["id"]
+    cur.execute("SELECT id, lower(name) AS name FROM need_categories")
+    by_name = {r["name"]: r["id"] for r in cur.fetchall()}
+    for gap in result.gaps:
+        cur.execute(
+            "INSERT INTO audit_gaps (audit_id, title, kind, category_id, category_name, "
+            "reference, detail, severity, action, focus) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+            (audit_id, gap.title, gap.kind, by_name.get(gap.category.strip().lower()),
+             gap.category, gap.reference, gap.detail, gap.severity, gap.action, gap.focus))
+    cur.execute("UPDATE audit_gaps SET status = 'closed', closed_by = %s "
+                "WHERE id = ANY(%s) AND status IN ('proposed', 'approved') AND audit_id <> %s "
+                "RETURNING id", (audit_id, result.closed, audit_id))
+    closed = len(cur.fetchall())
+    return {"audit": audit_id, "gaps": len(result.gaps), "closed": closed}
+
+
+@app.get("/gaps")
+def get_gaps():
+    """Catalogue gaps from the monthly audits, newest first, with the
+    maintainer's decision (``status``: proposed, approved, rejected or
+    closed) and, for an acted discover gap, its discovery job's status."""
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT g.id, g.title, g.kind, g.category_id, g.category_name AS category,
+                       g.reference, g.detail, g.severity, g.action, g.focus, g.status,
+                       g.decision_note, g.decided_at, g.created_at, a.month,
+                       (SELECT j.status FROM jobs j WHERE j.unit_key =
+                        'candidate-discovery:gap:' || g.id) AS discovery
+                FROM audit_gaps g JOIN catalogue_audits a ON a.id = g.audit_id
+                ORDER BY g.created_at DESC, g.id DESC
+                """
+            )
+            return cur.fetchall()
+
+
+@app.get("/audits")
+def get_audits():
+    """Catalogue audits, newest first, with gap counts by status."""
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT a.id, a.month, a.summary, a.created_at,
+                       (SELECT jsonb_object_agg(status, n) FROM (
+                           SELECT status, count(*) AS n FROM audit_gaps
+                           WHERE audit_id = a.id GROUP BY status) s) AS gaps
+                FROM catalogue_audits a ORDER BY a.created_at DESC, a.id DESC
+                """
+            )
+            return cur.fetchall()
+
+
+@app.post("/gaps/{gap_id}/decision")
+def decide_gap(gap_id: int, item: Decision):
+    """The maintainer acts on a gap (approved), ignores it (rejected) or
+    reopens it (proposed). Acting on a discover gap in an existing category
+    queues a candidate-discovery job focused on the gap."""
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM audit_gaps WHERE id = %s FOR UPDATE", (gap_id,))
+            gap = cur.fetchone()
+            if gap is None:
+                raise HTTPException(status_code=404, detail="not found")
+            if gap["status"] == "closed":
+                raise HTTPException(status_code=409, detail="gap is closed")
+            cur.execute("UPDATE audit_gaps SET status = %s, decision_note = %s, "
+                        "decided_at = NOW() WHERE id = %s",
+                        (item.decision, item.note or None, gap_id))
+            job = None
+            if item.decision == "approved" and gap["action"] == "discover" and gap["category_id"]:
+                cur.execute("SELECT id, layer, name, scope, track FROM need_categories "
+                            "WHERE id = %s", (gap["category_id"],))
+                category = cur.fetchone()
+                cur.execute("SELECT name FROM projects WHERE category_id = %s ORDER BY id",
+                            (category["id"],))
+                known = [r["name"] for r in cur.fetchall()]
+                payload = {"category_id": category["id"],
+                           **research.discovery_input(category, known,
+                                                      _latest_brief(cur, category["id"]))}
+                job = _enqueue(cur, unit_key=f"{research.DISCOVERY}:gap:{gap_id}",
+                               job_type=research.DISCOVERY,
+                               priority=audit.DISCOVERY_PRIORITY,
+                               payload=audit.focused_discovery(payload, gap))
+        conn.commit()
+    return {"id": gap_id, "status": item.decision, "discovery_job": job["id"] if job else None}
+
+
+# ---------------------------------------------------------------------------
 # Job claiming
 # ---------------------------------------------------------------------------
 
@@ -2581,6 +2742,8 @@ def complete_job(job_id: int, item: JobComplete):
                     if job_type == research.PROGRESS else None)
         safety = (research.SafetyResult(**item.output)
                   if job_type == research.SAFETY else None)
+        audited = (audit.AuditResult(**item.output)
+                   if job_type == audit.AUDIT else None)
         if assessment is not None:
             # Only an enabler lists the needs it serves (section 2a).
             assessment.serves = list(dict.fromkeys(
@@ -2680,6 +2843,9 @@ def complete_job(job_id: int, item: JobComplete):
                                             str(item.output.get("summary") or ""))
                 elif safety is not None:
                     extra = _store_safety(cur, result, safety)
+                elif audited is not None:
+                    extra = _store_audit(cur, result, audited,
+                                         str(item.output.get("summary") or ""))
                 elif job_type == research.LITERATURE and result["question_id"]:
                     cur.execute(
                         "UPDATE questions SET status = 'answered' "

@@ -1319,14 +1319,89 @@ def test_one_waiting_discovery_scan_per_category(client):
     [first] = [j for j in queued if j["unit_key"].startswith(f"candidate-discovery:category:{cid}:")]
     # A duplicate from an earlier period, then a new period while it waits.
     sql("INSERT INTO jobs (job_type, worker, status, priority, unit_key, input, created_at) "
-        "VALUES ('candidate-discovery', 'unassigned', 'queued', 0.6, 'old-period', %s, "
-        "NOW() + INTERVAL '1 second')", Jsonb({"category_id": cid}))
-    sql("UPDATE jobs SET unit_key = 'older-period' WHERE id = %s", first["id"])
+        "VALUES ('candidate-discovery', 'unassigned', 'queued', 0.6, %s, %s, "
+        "NOW() + INTERVAL '1 second')", f"candidate-discovery:category:{cid}:0",
+        Jsonb({"category_id": cid}))
+    sql("UPDATE jobs SET unit_key = %s WHERE id = %s",
+        f"candidate-discovery:category:{cid}:-1", first["id"])
     assert all(not j["unit_key"].startswith(f"candidate-discovery:category:{cid}:")
                for j in discover(client)["discovery"])
     rows = sql("SELECT id FROM jobs WHERE job_type = 'candidate-discovery' AND status = 'queued' "
                "AND input->>'category_id' = %s", str(cid))
     assert rows == [(first["id"],)]
+
+
+AUDIT_OUT = {"summary": "Water is well covered; cooking is missing.", "gaps": [
+    {"title": "No clean cooking projects", "kind": "missing-need", "category": "Water",
+     "reference": "Sphere: food security", "detail": "No project addresses cooking smoke.",
+     "severity": "High", "action": "discover", "focus": "improved biomass cookstoves"},
+    {"title": "No pump standard", "kind": "missing-standard", "category": "Proposed: Pumps",
+     "reference": "GVCS", "detail": "Pumps need a shared interface.", "severity": "low",
+     "action": "standard"}], "closed": []}
+
+
+def test_a_monthly_audit_lists_gaps_for_the_maintainer(client):
+    import modular
+
+    screened(10)
+    [job] = discover(client)["audit"]
+    assert job["unit_key"] == f"catalogue-audit:{modular.month()}"
+    assert discover(client)["audit"] == []  # once a month
+    [(payload,)] = sql("SELECT input FROM jobs WHERE job_type = 'catalogue-audit'")
+    water = next(c for c in payload["categories"] if c["name"] == "Water")
+    assert water["projects"] and "Sphere Handbook" in " ".join(payload["references"])
+    assert len(payload["projects"]) == 10 and payload["previous_gaps"] == []
+    _, r = run_job(client, "catalogue-audit", AUDIT_OUT)
+    assert r.status_code == 200, r.text
+    gaps = {g["title"]: g for g in client.get("/gaps").json()}
+    cooking, pump = gaps["No clean cooking projects"], gaps["No pump standard"]
+    assert cooking["severity"] == "high" and cooking["category_id"] and cooking["status"] == "proposed"
+    assert pump["category_id"] is None and pump["category"] == "Proposed: Pumps"
+    [audit_row] = client.get("/audits").json()
+    assert audit_row["gaps"] == {"proposed": 2} and audit_row["summary"].startswith("Water")
+    # Acting on a discover gap queues a discovery focused on it; ignoring
+    # a standard gap records the decision only.
+    r = client.post(f"/gaps/{cooking['id']}/decision", json={"decision": "approved"})
+    assert r.status_code == 200 and r.json()["discovery_job"]
+    [(focus_input, key)] = sql("SELECT input, unit_key FROM jobs WHERE id = %s",
+                               r.json()["discovery_job"])
+    assert key == f"candidate-discovery:gap:{cooking['id']}"
+    assert focus_input["instructions"].startswith("Focus this search")
+    assert "improved biomass cookstoves" in focus_input["instructions"]
+    r = client.post(f"/gaps/{pump['id']}/decision", json={"decision": "rejected", "note": "later"})
+    assert r.json()["discovery_job"] is None
+    assert client.get("/gaps").json()[0]["discovery"] in ("queued", None)
+    # The next audit sees the gaps and closes the one now covered.
+    sql("UPDATE jobs SET unit_key = 'last-month' WHERE job_type = 'catalogue-audit'")
+    discover(client)
+    [(payload,)] = sql("SELECT input FROM jobs WHERE job_type = 'catalogue-audit' "
+                       "AND status = 'queued'")
+    assert {g["status"] for g in payload["previous_gaps"]} == {"approved", "rejected"}
+    _, r = run_job(client, "catalogue-audit", {"summary": "Cooking found.", "gaps": [],
+                                               "closed": [cooking["id"], pump["id"]]})
+    assert r.json()["closed"] == 1  # an ignored gap is not closed
+    statuses = {g["title"]: g["status"] for g in client.get("/gaps").json()}
+    assert statuses == {"No clean cooking projects": "closed", "No pump standard": "rejected"}
+    assert client.post(f"/gaps/{cooking['id']}/decision",
+                       json={"decision": "approved"}).status_code == 409
+    assert client.post("/gaps/999/decision", json={"decision": "approved"}).status_code == 404
+
+
+def test_a_gap_discovery_is_not_folded_into_a_regular_scan(client):
+    cid = water_progress_setup()
+    sql("UPDATE jobs SET status = 'completed' WHERE job_type <> 'candidate-discovery'")
+    discover(client)  # the regular scan for Water is queued
+    sql("INSERT INTO catalogue_audits (month, summary) VALUES ('202610', 's')")
+    sql("INSERT INTO audit_gaps (audit_id, title, kind, category_id, category_name, detail, "
+        "severity, action, focus) SELECT id, 'Gap', 'thin-coverage', %s, 'Water', "
+        "'Too few filters.', 'high', 'discover', 'ceramic filters' FROM catalogue_audits",
+        cid)
+    [(gid,)] = sql("SELECT id FROM audit_gaps")
+    client.post(f"/gaps/{gid}/decision", json={"decision": "approved"})
+    discover(client)
+    keys = [k for (k,) in sql("SELECT unit_key FROM jobs WHERE job_type = 'candidate-discovery' "
+                              "AND status = 'queued' AND input->>'category_id' = %s", str(cid))]
+    assert f"candidate-discovery:gap:{gid}" in keys and len(keys) == 2
 
 
 def test_over_long_verification_text_is_clipped_not_rejected(client):
