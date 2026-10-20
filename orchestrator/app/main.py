@@ -1448,6 +1448,16 @@ def _modular_set(cur, budget: int, month: str | None = None) -> list:
     cur.execute("SELECT supersedes, code FROM standards "
                 "WHERE status = 'approved' AND supersedes IS NOT NULL")
     superseded = {r["supersedes"]: r["code"] for r in cur.fetchall()}
+    cur.execute("SELECT code, name, kind, spec, status, decision_note FROM standards "
+                "WHERE status IN ('proposed', 'rejected') ORDER BY code")
+    pending, rejected = [], []
+    for r in cur.fetchall():
+        if r["status"] == "proposed":
+            pending.append({"code": r["code"], "name": r["name"], "kind": r["kind"],
+                            "spec": _clip(r["spec"], 300)})
+        else:
+            rejected.append({"code": r["code"], "name": r["name"],
+                             "why": _clip(r["decision_note"], 200)})
     for category in _focus_categories(cur):
         cur.execute("SELECT count(DISTINCT a.project_id) AS n FROM assessments a "
                     "JOIN projects p ON p.id = a.project_id WHERE p.category_id = %s",
@@ -1461,7 +1471,8 @@ def _modular_set(cur, budget: int, month: str | None = None) -> list:
             "category_id": category["id"],
             **modular.module_input(category, _latest_brief(cur, category["id"]),
                                    _projects_digest(cur, category["id"], 25, detail=True),
-                                   standards, _modules_digest(cur), superseded)})
+                                   standards, _modules_digest(cur), superseded,
+                                   pending, rejected)})
 
     if _wave_pending(cur, modular.MODULES, month):
         return created

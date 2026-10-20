@@ -518,13 +518,20 @@ def verification_input(standard: dict) -> dict[str, Any]:
 
 def module_input(category: dict, brief: dict | None, projects: list[dict],
                  standards: list[dict], modules: list[dict],
-                 superseded: dict[str, str] | None = None) -> dict[str, Any]:
+                 superseded: dict[str, str] | None = None,
+                 pending: list[dict] | None = None,
+                 rejected: list[dict] | None = None) -> dict[str, Any]:
     return {
         "domain": category["name"],
         **({"track": category["track"]} if category.get("track") else {}),
         **({"need_brief": brief} if brief else {}),
         "projects": projects,
         "approved_standards": standards,
+        # Waiting for the maintainer, or turned down: so a module references
+        # a pending standard instead of proposing a duplicate (October 2026:
+        # one module wave proposed 25 standards, 19 of them rejected).
+        **({"pending_standards": pending} if pending else {}),
+        **({"rejected_standards": rejected} if rejected else {}),
         "existing_modules": modules,
         # A module still on a superseded standard moves to its successor.
         **({"superseded_standards": superseded,
@@ -550,9 +557,15 @@ def module_input(category: dict, brief: dict | None, projects: list[dict],
             "unknown or unchecked means confirm the licence from its repository "
             "first and give it in notes. Connect modules only through "
             "approved_standards "
-            "(reference each by its code in interfaces); if a module needs an "
-            "interface no approved standard covers, propose that standard in "
-            "new_standards and the module waits for its approval. Reuse or "
+            "(reference each by its code in interfaces). pending_standards are "
+            "proposed and waiting for the maintainer: when one covers an "
+            "interface a module needs, reference it by its code and the module "
+            "waits for its approval; do not propose another standard for the "
+            "same interface. Propose a new standard in new_standards only for "
+            "an interface shared between modules that neither list covers, "
+            "never for one module's own ports, record or report formats, or a "
+            "product's API; do not propose again anything in "
+            "rejected_standards (each says why it was rejected). Reuse or "
             "extend existing_modules by giving the same code rather than "
             "duplicating them. List each module's bill of materials. "
             + _COSTS + " maturity: concept (an idea) or documented (public "

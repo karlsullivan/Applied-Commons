@@ -1256,6 +1256,24 @@ def test_modules_get_an_approved_standards_whole_text(client):
     assert payload["approved_standards"][0]["spec"] == spec and len(spec) > 1200
 
 
+def test_modules_see_pending_and_rejected_standards(client):
+    screened(10)
+    for code in ("dc-bus-24v", "pipe-32", "rf-433"):
+        client.post("/standards", json={**STANDARD, "code": code})
+    ids = {s["code"]: s["id"] for s in client.get("/standards").json()}
+    verify_standards()
+    client.post(f"/standards/{ids['dc-bus-24v']}/decision", json={"decision": "approved"})
+    client.post(f"/standards/{ids['rf-433']}/decision",
+                json={"decision": "rejected", "note": "Product-specific radio."})
+    discover(client)
+    [(payload,)] = sql("SELECT input FROM jobs WHERE job_type = 'module-synthesis' LIMIT 1")
+    assert [s["code"] for s in payload["approved_standards"]] == ["dc-bus-24v"]
+    assert [s["code"] for s in payload["pending_standards"]] == ["pipe-32"]
+    assert payload["rejected_standards"] == [
+        {"code": "rf-433", "name": STANDARD["name"], "why": "Product-specific radio."}]
+    assert "pending_standards" in payload["instructions"]
+
+
 def test_over_long_verification_text_is_clipped_not_rejected(client):
     screened(10)
     discover(client)
