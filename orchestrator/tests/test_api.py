@@ -42,7 +42,8 @@ def clean(client):
     with psycopg.connect(DB_URL) as conn:
         conn.execute(
             "TRUNCATE jobs, findings, evidence, questions, projects, sites, modules, "
-            "systems, standards, roadmaps RESTART IDENTITY CASCADE"
+            "systems, standards, roadmaps, graph_updates, graph_sources, needs, "
+            "capabilities, graph_assessments RESTART IDENTITY CASCADE"
         )
         conn.execute("UPDATE need_categories SET solved_at = NULL, solved_note = NULL")
     yield
@@ -1849,3 +1850,290 @@ def test_safety_verdict_floor(hazard, verdict):
     assert review.verdict == verdict
     strict = research.SafetyResult(**safety_out("do-not-build", hazard)).safety
     assert strict.verdict == "do-not-build"  # never made milder
+
+
+# ---------------------------------------------------------------------------
+# Civilisation Capability Graph (policy section 4k)
+# ---------------------------------------------------------------------------
+
+GINGERY = {"key": "gingery-shop-from-scrap", "family": "book_manual",
+           "source_type": "book_manual", "title": "Build Your Own Metal Working Shop From Scrap",
+           "bibliographic": {"author": "David J. Gingery", "volumes": 7},
+           "source_quality": "high", "source_authority": "established-reference"}
+AC_WIKI = {"key": "ac-wiki:Precision_turning", "family": "ac-wiki", "source_type": "mediawiki",
+           "title": "Precision turning", "source_authority": "established-reference"}
+
+
+def turning_update(**extra):
+    update = {
+        "origin": "maintainer", "proposed_by": "Claude Code (claude-opus-5-5)",
+        "summary": "Metalworking acceptance problem, first pass",
+        "sources": [GINGERY, AC_WIKI],
+        "needs": [{"code": "safe-drinking-water", "category": "water",
+                   "name": "Reliable access to safe drinking water",
+                   "baseline_threshold": "Microbiologically safe water, 15 l/person/day",
+                   "improvements": ["lower energy", "lower labour"]}],
+        "capabilities": [
+            {"code": "metal-casting", "name": "Metal casting", "bootstrap_level": "B1-B2"},
+            {"code": "precision-turning", "name": "Precision turning",
+             "bootstrap_level": "B2", "requires": {"tools": ["cutting tools"]},
+             "resilience": {"grid_dependency": "Medium", "bogus": "high"}},
+            {"code": "pumping", "name": "Pumping water", "bootstrap_level": "B1"},
+        ],
+        "links": [
+            {"capability": "pumping", "need": "safe-drinking-water"},
+            {"capability": "precision-turning", "category": "Autonomy and productive capability"},
+            {"capability": "precision-turning", "category": "Energy", "relevance": "supporting"},
+        ],
+        "dependencies": [{"capability": "precision-turning", "requires": "metal-casting",
+                          "state": "SUPPORTED", "source": "gingery-shop-from-scrap",
+                          "locator": "Book 2, The Metal Lathe"}],
+        "implementations": [
+            {"code": "gingery-lathe", "capability": "precision-turning",
+             "name": "Gingery-style cast lathe", "pathway": "bootstrap",
+             "bootstrap_level": "B2", "evidence_maturity": "E2-E3",
+             "validation": {"built": {"answer": "Many builds documented", "state": "SUPPORTED",
+                                      "source": "gingery-shop-from-scrap"},
+                            "operating_duration": "unknown", "not-a-question": "x"}},
+            {"code": "hand-pump-afridev", "capability": "pumping", "name": "Afridev hand pump",
+             "pathway": "purchase", "bootstrap_level": "B3", "evidence_maturity": "E4"},
+        ],
+    }
+    update.update(extra)
+    return update
+
+
+def post_graph(client, update):
+    r = client.post("/graph/updates", json=update)
+    assert r.status_code == 200, r.text
+    return r.json()
+
+
+def graph_id(table, code):
+    return sql(f"SELECT id FROM {table} WHERE code = %s", code)[0][0]
+
+
+def approve(client, kind, item_id, **extra):
+    return client.post(f"/graph/{kind}/{item_id}/decision",
+                       json={"decision": "approved", "decided_by": "maintainer", **extra})
+
+
+def test_a_graph_update_adds_candidates_under_the_existing_taxonomy(client):
+    result = post_graph(client, turning_update())
+    counts = result["counts"]
+    assert counts["sources_created"] == 2
+    assert counts["needs_created"] == 1 and counts["capabilities_created"] == 3
+    assert counts["capability_links_created"] == 3
+    assert counts["capability_dependencies_created"] == 1
+    assert counts["implementations_created"] == 2
+    assert result["skipped"] == []
+    # Everything arrives as a candidate, linked to the existing categories.
+    assert {r[0] for r in sql("SELECT status FROM capabilities")} == {"candidate"}
+    caps = {c["code"]: c for c in client.get("/graph/capabilities").json()}
+    assert caps["precision-turning"]["serves"] == ["Autonomy and productive capability", "Energy"]
+    assert caps["precision-turning"]["bootstrap"] == "B2"
+    detail = client.get(f"/graph/capabilities/{caps['precision-turning']['id']}").json()
+    assert detail["capability"]["resilience"]["grid_dependency"] == "medium"
+    assert "bogus" not in detail["capability"]["resilience"]
+    assert detail["requires"][0]["requires"] == "metal-casting"
+    assert detail["requires"][0]["state"] == "SUPPORTED"
+    lathe = detail["implementations"][0]
+    # Claimed E2-E3, but nothing independent supports it yet: E0.
+    assert lathe["evidence_maturity"]["claimed"] == "E2-E3"
+    assert lathe["evidence_maturity"]["level"] == 0
+    assert lathe["validation"]["built"]["state"] == "SUPPORTED"
+    assert lathe["validation"]["operating_duration"]["answer"] == "unknown"
+    assert lathe["validation"]["independently_reproduced"]["state"] == "UNKNOWN"
+    assert "not-a-question" not in lathe["validation"]
+    caster = client.get(f"/graph/capabilities/{caps['metal-casting']['id']}").json()
+    assert caster["required_by"][0]["capability"] == "precision-turning"
+
+
+def test_the_graph_never_adds_a_category_of_its_own(client):
+    before = sql("SELECT count(*) FROM need_categories")[0][0]
+    result = post_graph(client, {
+        "origin": "applied-commons", "proposed_by": "ac-research worker",
+        "needs": [{"code": "workshop-access", "category": "Workshops", "name": "Workshop access"}],
+        "capabilities": [{"code": "forging", "name": "Forging"}],
+        "links": [{"capability": "forging", "category": "Metalworking"},
+                  {"capability": "nothing", "category": "Water"}]})
+    assert sql("SELECT count(*) FROM need_categories")[0][0] == before
+    assert sql("SELECT count(*) FROM needs")[0][0] == 0
+    assert len(result["skipped"]) == 3
+    assert any("Workshops" in s for s in result["skipped"])
+
+
+def test_an_inference_never_becomes_fact(client):
+    post_graph(client, turning_update())
+    result = post_graph(client, {
+        "origin": "applied-commons", "proposed_by": "ac-research worker",
+        "assessments": [
+            # No source: kept, as INFERRED.
+            {"subject_type": "implementation", "subject": "gingery-lathe",
+             "attribute": "evidence_maturity", "value": "E3", "state": "SUPPORTED"},
+            # Applied Commons' own wiki is not independent evidence.
+            {"subject_type": "implementation", "subject": "gingery-lathe",
+             "attribute": "evidence_maturity", "value": "E4", "state": "supported",
+             "source": "ac-wiki:Precision_turning"},
+        ]})
+    assert result["counts"]["downgraded"] == 2
+    states = sql("SELECT state FROM graph_assessments ORDER BY id")
+    assert [s[0] for s in states] == ["INFERRED", "INFERRED"]
+    assert sql("SELECT origin FROM graph_sources WHERE key = 'ac-wiki:Precision_turning'") == [
+        ("applied-commons",)]
+    lathe = client.get(f"/graph/capabilities/{graph_id('capabilities', 'precision-turning')}"
+                       ).json()["implementations"][0]
+    assert lathe["evidence_maturity"]["level"] == 0
+    # An independent source does count; the lower end of a range is what it supports.
+    post_graph(client, {
+        "origin": "maintainer", "proposed_by": "maintainer",
+        "assessments": [{"subject_type": "implementation", "subject": "gingery-lathe",
+                         "attribute": "evidence_maturity", "value": "E2-E3",
+                         "state": "SUPPORTED", "source": "gingery-shop-from-scrap",
+                         "locator": "Book 2, foreword"}]})
+    lathe = client.get(f"/graph/capabilities/{graph_id('capabilities', 'precision-turning')}"
+                       ).json()["implementations"][0]
+    assert lathe["evidence_maturity"]["supported"] == "E2"
+    assert lathe["evidence_maturity"]["level"] == 2
+    # Disagreement is kept: three claims about the same attribute.
+    claims = lathe["assessments"]
+    assert len(claims) == 3 and all(c["conflicted"] for c in claims)
+
+
+def test_decided_records_are_kept_and_gain_only_assessments(client):
+    post_graph(client, turning_update())
+    cap = graph_id("capabilities", "precision-turning")
+    r = approve(client, "capabilities", cap)
+    assert r.status_code == 200, r.text
+    again = turning_update()
+    again["capabilities"][1]["name"] = "Turning, renamed by a later proposal"
+    again["assessments"] = [{"subject_type": "capability", "subject": "precision-turning",
+                             "attribute": "bootstrap_level", "value": "B3",
+                             "basis": "Needs a reasonably equipped shop for the bed."}]
+    result = post_graph(client, again)
+    assert result["counts"]["capabilities_kept"] == 1
+    assert result["counts"]["capabilities_updated"] == 2  # the other two are still candidates
+    assert sql("SELECT name FROM capabilities WHERE id = %s", cap) == [("Precision turning",)]
+    assert sql("SELECT value FROM graph_assessments") == [({"min": 3, "max": 3},)]
+    # A rejected link stays rejected when proposed again.
+    link = sql("SELECT id FROM capability_links WHERE capability_id = %s AND relevance = "
+               "'supporting'", cap)[0][0]
+    r = client.post(f"/graph/links/{link}/decision", json={"decision": "rejected"})
+    assert r.json()["status"] == "rejected"
+    result = post_graph(client, turning_update())
+    assert result["counts"]["capability_links_kept"] == 1
+    assert sql("SELECT status FROM capability_links WHERE id = %s", link) == [("rejected",)]
+
+
+def test_approval_follows_the_graph_and_needs_independent_checks(client):
+    post_graph(client, turning_update(), )
+    post_graph(client, {
+        "origin": "maintainer", "proposed_by": "maintainer",
+        "capabilities": [{"code": "wound-care", "name": "Wound care"},
+                         {"code": "unlinked", "name": "Not linked to any need"}],
+        "links": [{"capability": "wound-care", "category": "Physical and mental health"}],
+        "implementations": [{"code": "pressure-dressing", "capability": "wound-care",
+                             "name": "Pressure dressing", "pathway": "practice"}]})
+    r = approve(client, "capabilities", graph_id("capabilities", "unlinked"))
+    assert r.status_code == 409 and "link" in r.json()["detail"]
+    r = approve(client, "implementations", graph_id("implementations", "gingery-lathe"))
+    assert r.status_code == 409 and "capability first" in r.json()["detail"]
+    # Medical: the approval names the independent check behind it.
+    wound = graph_id("capabilities", "wound-care")
+    assert approve(client, "capabilities", wound).status_code == 409
+    r = approve(client, "capabilities", wound,
+                independent_check="Hesperian, Where There Is No Doctor ch. 7, checked by a nurse")
+    assert r.status_code == 200, r.text
+    dressing = graph_id("implementations", "pressure-dressing")
+    assert approve(client, "implementations", dressing).status_code == 409
+    assert approve(client, "implementations", dressing,
+                   independent_check="AC research worker").status_code == 200
+    row = sql("SELECT decided_by, independent_check FROM implementations WHERE id = %s",
+              dressing)
+    assert row == [("maintainer", "AC research worker")]
+    # Safety-critical anywhere needs the same.
+    post_graph(client, {"origin": "maintainer", "proposed_by": "maintainer",
+                        "implementations": [{"code": "lathe-3ph", "capability": "precision-turning",
+                                             "name": "Three-phase lathe", "pathway": "purchase",
+                                             "safety_critical": True}]})
+    approve(client, "capabilities", graph_id("capabilities", "precision-turning"))
+    assert approve(client, "implementations",
+                   graph_id("implementations", "lathe-3ph")).status_code == 409
+    assert client.post("/graph/widgets/1/decision", json={"decision": "approved"}
+                       ).status_code == 404
+
+
+def test_a_need_shows_its_capabilities_and_gaps_by_bootstrap_level(client):
+    post_graph(client, turning_update())
+    need = graph_id("needs", "safe-drinking-water")
+    detail = client.get(f"/graph/needs/{need}").json()
+    assert detail["need"]["category"] == "Water" and detail["need"]["layer"] == 1
+    assert [c["capability"] for c in detail["capabilities"]] == ["pumping"]
+    assert detail["gaps"][0]["kind"] == "no approved implementation"
+    # An approved, field-proven pump closes the gap, but not at B1-B2.
+    approve(client, "capabilities", graph_id("capabilities", "pumping"))
+    approve(client, "implementations", graph_id("implementations", "hand-pump-afridev"))
+    post_graph(client, {
+        "origin": "maintainer", "proposed_by": "maintainer",
+        "sources": [{"key": "rwsn-afridev", "family": "rwsn", "source_type": "technical_collection",
+                     "title": "Afridev hand pump specification"}],
+        "assessments": [{"subject_type": "implementation", "subject": "hand-pump-afridev",
+                         "attribute": "evidence_maturity", "value": 4, "state": "SUPPORTED",
+                         "source": "rwsn-afridev"}]})
+    assert client.get(f"/graph/needs/{need}").json()["gaps"] == []
+    low = client.get(f"/graph/needs/{need}?max_bootstrap=2").json()
+    assert low["gaps"][0]["within_bootstrap"] == "B2"
+    assert client.get(f"/graph/needs/{need}?max_bootstrap=9").status_code == 422
+    needs = client.get("/graph/needs").json()
+    assert needs[0]["code"] == "safe-drinking-water" and needs[0]["capabilities"] == 1
+
+
+def test_sources_keep_licence_and_redistribution_safe(client):
+    post_graph(client, {"origin": "maintainer", "proposed_by": "maintainer", "sources": [
+        {"key": "where-there-is-no-doctor", "family": "hesperian", "source_type": "book_manual",
+         "title": "Where There Is No Doctor", "redistribution_allowed": True},
+        {"key": "appropedia:Slow_sand_filter", "family": "appropedia", "source_type": "mediawiki",
+         "title": "Slow sand filter", "license_original": "CC BY-SA 4.0",
+         "license_verified": True, "redistribution_allowed": True}]})
+    rows = {s["key"]: s for s in client.get("/graph/sources").json()}
+    assert rows["where-there-is-no-doctor"]["redistribution_allowed"] is False
+    assert rows["where-there-is-no-doctor"]["license_original"] == "unknown"
+    assert rows["appropedia:Slow_sand_filter"]["redistribution_allowed"] is True
+    # A source is recorded once; the same key again changes nothing.
+    result = post_graph(client, {"origin": "maintainer", "proposed_by": "maintainer",
+                                 "sources": [{**GINGERY, "key": "where-there-is-no-doctor"}]})
+    assert result["counts"] == {"sources_known": 1}
+
+
+def test_the_export_is_self_describing_and_approved_only(client):
+    post_graph(client, turning_update())
+    approve(client, "capabilities", graph_id("capabilities", "pumping"))
+    approve(client, "needs", graph_id("needs", "safe-drinking-water"))
+    doc = client.get("/graph/export").json()
+    assert doc["format"].startswith("applied-commons capability graph")
+    assert doc["graph_revision"] > 0
+    assert doc["scales"]["bootstrap"]["B2"] == "casting and basic machine tools"
+    assert doc["scales"]["evidence_maturity"]["E0"] == "concept"
+    assert len(doc["scales"]["validation_questions"]) == 12
+    assert [c["code"] for c in doc["capabilities"]] == ["pumping"]
+    assert [l["need"] for l in doc["links"]] == ["safe-drinking-water"]
+    assert doc["implementations"] == []
+    everything = client.get("/graph/export?candidates=true").json()
+    assert len(everything["capabilities"]) == 3
+    assert {i["capability"] for i in everything["implementations"]} == {
+        "precision-turning", "pumping"}
+    assert len(everything["dependencies"]) == 1
+
+
+def test_bootstrap_and_maturity_ranges_parse_or_stay_unknown(client):
+    import graph
+
+    assert graph.parse_range("B2", "B", 7) == (2, 2)
+    assert graph.parse_range("B1-B3", "B", 7) == (1, 3)
+    assert graph.parse_range("E2–E3", "E", 5) == (2, 3)
+    assert graph.parse_range([1, 3], "B", 7) == (1, 3)
+    assert graph.parse_range({"min": 4}, "E", 5) == (4, 4)
+    assert graph.parse_range("E9", "E", 5) is None
+    assert graph.parse_range("B3-B1", "B", 7) is None
+    assert graph.parse_range("unknown", "B", 7) is None
+    assert graph.parse_range(True, "B", 7) is None

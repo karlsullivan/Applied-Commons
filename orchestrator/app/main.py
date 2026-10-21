@@ -5,6 +5,7 @@ from datetime import datetime
 from typing import Any
 
 import audit
+import graph
 import modular
 import research
 
@@ -2563,6 +2564,105 @@ def decide_gap(gap_id: int, item: Decision):
                                payload=audit.focused_discovery(payload, gap))
         conn.commit()
     return {"id": gap_id, "status": item.decision, "discovery_job": job["id"] if job else None}
+
+
+# ---------------------------------------------------------------------------
+# Civilisation Capability Graph (policy section 4k; graph.py)
+# ---------------------------------------------------------------------------
+
+@app.post("/graph/updates")
+def graph_update(item: graph.GraphUpdate):
+    """A candidate graph update: sources, needs, capabilities, their links
+    and dependencies, implementations and assessments, referenced by code.
+    Candidates are created or replaced; decided records are kept and only
+    gain assessments. Items that cannot be placed are listed in
+    ``skipped`` rather than failing the whole update."""
+    with db() as conn:
+        with conn.cursor() as cur:
+            result = graph.apply_update(cur, item)
+        conn.commit()
+    return result
+
+
+@app.get("/graph/updates")
+def graph_updates(limit: int = 50):
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id, origin, proposed_by, job_id, agent_run, summary, counts, "
+                        "created_at FROM graph_updates ORDER BY id DESC LIMIT %s",
+                        (max(1, min(limit, 500)),))
+            return cur.fetchall()
+
+
+@app.get("/graph/needs")
+def graph_needs():
+    with db() as conn:
+        with conn.cursor() as cur:
+            return graph.list_needs(cur)
+
+
+@app.get("/graph/needs/{need_id}")
+def graph_need(need_id: int, max_bootstrap: int | None = None):
+    """A need with the capabilities it requires, their implementations and
+    the gaps; ``max_bootstrap`` (0-7) counts only implementations
+    buildable at that bootstrap level."""
+    if max_bootstrap is not None and not 0 <= max_bootstrap <= 7:
+        raise HTTPException(status_code=422, detail="max_bootstrap is 0 to 7")
+    with db() as conn:
+        with conn.cursor() as cur:
+            result = graph.need_detail(cur, need_id, max_bootstrap)
+    if result is None:
+        raise HTTPException(status_code=404, detail="not found")
+    return result
+
+
+@app.get("/graph/capabilities")
+def graph_capabilities():
+    with db() as conn:
+        with conn.cursor() as cur:
+            return graph.list_capabilities(cur)
+
+
+@app.get("/graph/capabilities/{capability_id}")
+def graph_capability(capability_id: int):
+    with db() as conn:
+        with conn.cursor() as cur:
+            result = graph.capability_detail(cur, capability_id)
+    if result is None:
+        raise HTTPException(status_code=404, detail="not found")
+    return result
+
+
+@app.get("/graph/sources")
+def graph_sources():
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM graph_sources ORDER BY key")
+            return cur.fetchall()
+
+
+@app.get("/graph/export")
+def graph_export(candidates: bool = False):
+    """The approved graph (with candidates if asked) as one document that
+    is readable without Applied Commons (offline package, section 35)."""
+    with db() as conn:
+        with conn.cursor() as cur:
+            return graph.export(cur, candidates)
+
+
+@app.post("/graph/{kind}/{item_id}/decision")
+def graph_decision(kind: str, item_id: int, item: graph.GraphDecision):
+    """The maintainer approves, rejects or reopens a need, capability or
+    implementation (kind needs, capabilities or implementations), or
+    rejects or restores a link or dependency (kind links or dependencies)."""
+    with db() as conn:
+        with conn.cursor() as cur:
+            status, body = graph.decide(cur, kind, item_id, item)
+        if status == 200:
+            conn.commit()
+    if status != 200:
+        raise HTTPException(status_code=status, detail=body["detail"])
+    return body
 
 
 # ---------------------------------------------------------------------------
