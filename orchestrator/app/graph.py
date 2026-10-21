@@ -30,6 +30,7 @@ from typing import Any
 from psycopg.types.json import Jsonb
 from pydantic import BaseModel, Field, field_validator
 
+import research
 from modular import _Clipped
 
 STATES = ("SUPPORTED", "INFERRED", "UNKNOWN", "CONFLICTED")
@@ -791,6 +792,7 @@ def decide(cur, kind: str, item_id: int, item: GraphDecision) -> tuple[int, dict
     row = cur.fetchone()
     if row is None:
         return 404, {"detail": "not found"}
+    check = (item.independent_check or "").strip()
     if item.decision == "approved":
         if kind == "capabilities":
             cur.execute("SELECT 1 FROM capability_links WHERE capability_id = %s "
@@ -801,15 +803,24 @@ def decide(cur, kind: str, item_id: int, item: GraphDecision) -> tuple[int, dict
             cur.execute("SELECT status FROM capabilities WHERE id = %s", (row["capability_id"],))
             if cur.fetchone()["status"] != "approved":
                 return 409, {"detail": "approve its capability first"}
-        if ((row.get("safety_critical") or _medical(cur, kind, row))
-                and not (item.independent_check or "").strip()):
-            return 409, {"detail": "safety-critical or medical: name the independent check"}
+        if (row.get("safety_critical") or _medical(cur, kind, row)) and not check:
+            # The independent check is the graph-review of this revision,
+            # unless the maintainer names another one.
+            review = latest_review(cur, NODES[kind], item_id, row["revision"])
+            if review is None:
+                return 409, {"detail": "safety-critical or medical: waiting for its independent "
+                                       "review (graph-review), or name the independent check"}
+            if review["recommendation"] != "approve":
+                return 409, {"detail": f"its independent review recommends "
+                                       f"{review['recommendation']}: revise it, or name an "
+                                       f"independent check to approve anyway"}
+            check = (f"graph-review {review['id']} (job {review['job_id']}, "
+                     f"{review['reviewer']}): approve")
     cur.execute(
         f"UPDATE {kind} SET status = %s, decision_note = %s, decided_by = %s, "
         f"independent_check = %s, decided_at = NOW(), revision = nextval('graph_revision') "
-        f"WHERE id = %s RETURNING id, code, status",
-        (item.decision, item.note or None, item.decided_by,
-         (item.independent_check or "").strip() or None, item_id))
+        f"WHERE id = %s RETURNING id, code, status, independent_check",
+        (item.decision, item.note or None, item.decided_by, check or None, item_id))
     return 200, cur.fetchone()
 
 
@@ -964,6 +975,7 @@ def need_detail(cur, need_id: int, max_bootstrap: int | None = None) -> dict | N
                 "within_bootstrap": None if max_bootstrap is None else f"B{max_bootstrap}"})
     return {"need": need, "capabilities": capabilities, "gaps": gaps,
             "assessments": _assessments(cur, "need", need_id),
+            "review": latest_review(cur, "need", need_id),
             "note": "Gaps are derived from approved records and sourced evidence only; "
                     "the baseline status is a separate judgement."}
 
@@ -1000,6 +1012,7 @@ def capability_detail(cur, capability_id: int) -> dict | None:
     for i in impls:
         out = _implementation(i, supported)
         out["assessments"] = _assessments(cur, "implementation", i["id"])
+        out["review"] = latest_review(cur, "implementation", i["id"])
         implementations.append(out)
     return {
         "capability": _capability(row),
@@ -1008,6 +1021,7 @@ def capability_detail(cur, capability_id: int) -> dict | None:
         "required_by": _dependencies(cur, "d.requires_id = %s", (capability_id,)),
         "implementations": implementations,
         "assessments": _assessments(cur, "capability", capability_id),
+        "review": latest_review(cur, "capability", capability_id),
     }
 
 
@@ -1080,3 +1094,229 @@ def export(cur, include_candidates: bool = False) -> dict[str, Any]:
         "assessments": assessments,
         "sources": sources,
     }
+
+
+# ---------------------------------------------------------------------------
+# Independent review of safety-critical and medical candidates
+# ---------------------------------------------------------------------------
+
+REVIEW = "graph-review"
+REVIEW_PRIORITY = 0.85
+VERDICTS = ("confirmed", "unsupported", "contradicted", "unclear")
+RECOMMENDATIONS = ("approve", "revise", "reject")
+
+
+class Finding(_Clipped):
+    """One claim of the record, checked against a source."""
+    attribute: str = "claim"
+    claim: str = Field(min_length=3, max_length=600)
+    verdict: str = "unclear"
+    value: Any = None
+    source_url: str | None = Field(default=None, max_length=2000)
+    source_title: str = Field(default="", max_length=400)
+    locator: str = Field(default="", max_length=300)
+    note: str = Field(default="", max_length=1000)
+
+    @field_validator("attribute", mode="before")
+    @classmethod
+    def _attribute(cls, value):
+        text = re.sub(r"[^a-z0-9_.-]+", "_", str(value or "").strip().lower()).strip("_")[:60]
+        return text if re.fullmatch(r"[a-z][a-z0-9_.-]{1,59}", text) else "claim"
+
+    @field_validator("verdict", mode="before")
+    @classmethod
+    def _verdict(cls, value):
+        return _choice(value, VERDICTS, "unclear")
+
+    @field_validator("source_url", mode="before")
+    @classmethod
+    def _url(cls, value):
+        text = str(value or "").strip()
+        return text if re.match(r"^https?://", text) else None
+
+
+class GraphReview(_Clipped):
+    recommendation: str
+    summary: str = Field(min_length=10, max_length=2000)
+    findings: list[Finding] = Field(default_factory=list, max_length=40)
+    missing_hazards: list[str] = Field(default_factory=list)
+    unchecked: list[str] = Field(default_factory=list)
+    supported_maturity: Any = None
+
+    @field_validator("recommendation", mode="before")
+    @classmethod
+    def _recommendation(cls, value):
+        text = str(value or "").strip().lower()
+        if text not in RECOMMENDATIONS:
+            raise ValueError(f"recommendation must be one of {list(RECOMMENDATIONS)}")
+        return text
+
+    @field_validator("missing_hazards", "unchecked", mode="before")
+    @classmethod
+    def _lists(cls, value):
+        return _texts(value, 20, 400)
+
+
+class GraphReviewResult(BaseModel):
+    review: GraphReview
+
+
+def latest_review(cur, subject_type: str, subject_id: int,
+                  revision: int | None = None) -> dict | None:
+    """The newest review of a record (of that revision, if given)."""
+    cur.execute(
+        "SELECT * FROM graph_reviews WHERE subject_type = %s AND subject_id = %s "
+        "AND (%s::bigint IS NULL OR revision = %s) ORDER BY created_at DESC, id DESC LIMIT 1",
+        (subject_type, subject_id, revision, revision))
+    return cur.fetchone()
+
+
+def review_due(cur) -> list[tuple[str, dict]]:
+    """Candidates that need an independent review: safety-critical ones, and
+    medical ones (records in or serving the health and early-life
+    categories). A review covers one revision; a changed candidate is
+    reviewed again."""
+    medical = list(MEDICAL)
+    cur.execute(
+        "SELECT n.* FROM needs n JOIN need_categories c ON c.id = n.category_id "
+        "WHERE n.status = 'candidate' AND c.name = ANY(%s) ORDER BY n.id", (medical,))
+    due = [("need", r) for r in cur.fetchall()]
+    cur.execute(
+        "SELECT cap.* FROM capabilities cap WHERE cap.status = 'candidate' AND "
+        "(cap.safety_critical OR EXISTS (SELECT 1 FROM capability_links l JOIN need_categories c "
+        " ON c.id = l.category_id WHERE l.capability_id = cap.id AND l.status = 'active' "
+        " AND c.name = ANY(%s))) ORDER BY cap.id", (medical,))
+    due += [("capability", r) for r in cur.fetchall()]
+    cur.execute(
+        "SELECT i.* FROM implementations i WHERE i.status = 'candidate' AND "
+        "(i.safety_critical OR EXISTS (SELECT 1 FROM capability_links l JOIN need_categories c "
+        " ON c.id = l.category_id WHERE l.capability_id = i.capability_id AND l.status = 'active' "
+        " AND c.name = ANY(%s))) ORDER BY i.id", (medical,))
+    due += [("implementation", r) for r in cur.fetchall()]
+    return [(kind, row) for kind, row in due
+            if latest_review(cur, kind, row["id"], row["revision"]) is None]
+
+
+def _review_record(cur, kind: str, row: dict) -> dict[str, Any]:
+    if kind == "need":
+        cur.execute("SELECT name, layer FROM need_categories WHERE id = %s", (row["category_id"],))
+        category = cur.fetchone()
+        record = {k: row[k] for k in ("code", "name", "desired_state", "minimum_threshold",
+                                      "baseline_threshold", "improved_threshold",
+                                      "improvements", "baseline_status", "baseline_note")}
+        return {**record, "category": category["name"], "layer": category["layer"]}
+    if kind == "capability":
+        detail = capability_detail(cur, row["id"])
+        return {**detail["capability"],
+                "serves": [{k: l[k] for k in ("category", "need", "relevance", "note", "state",
+                                              "source", "locator")} for l in detail["serves"]],
+                "requires": [{k: d[k] for k in ("requires", "kind", "note", "state")}
+                             for d in detail["requires"]],
+                "implementations": [{k: i[k] for k in ("code", "name", "pathway", "bootstrap")}
+                                    for i in detail["implementations"]]}
+    supported = _supported(cur, [row["id"]])
+    cur.execute("SELECT code, name, description FROM capabilities WHERE id = %s",
+                (row["capability_id"],))
+    return {**_implementation(row, supported), "capability": cur.fetchone()}
+
+
+def review_input(cur, kind: str, row: dict) -> dict[str, Any]:
+    """The job input for an independent review of one candidate."""
+    assessments = _assessments(cur, kind, row["id"])
+    keys = {a["source"] for a in assessments if a.get("source")}
+    record = _review_record(cur, kind, row)
+    if kind == "implementation":
+        keys |= {s for s in (v.get("source_id") for v in row["validation"].values()) if s}
+    cur.execute("SELECT key, title, uri, revision FROM graph_sources WHERE key = ANY(%s) "
+                "OR id = ANY(%s) ORDER BY key",
+                ([k for k in keys if isinstance(k, str)], [k for k in keys if isinstance(k, int)]))
+    sources = cur.fetchall()
+    return {
+        "subject_type": kind, "subject_id": row["id"], "revision": row["revision"],
+        "proposed_by": row["proposed_by"],
+        "record": record,
+        "claims": [{k: a[k] for k in ("attribute", "value", "state", "source", "locator",
+                                      "basis", "assessor")} for a in assessments],
+        "sources": sources,
+        "instructions": (
+            "Independently review this candidate record in Applied Commons' capability "
+            "graph before the maintainer decides on it. It is safety-critical or medical, "
+            "and it was drafted by someone else (proposed_by): you are its independent "
+            "check, so do not take its claims on trust. Check each material claim, such "
+            "as evidence maturity, validation answers, performance figures and thresholds, "
+            "hazards and failure modes, and bootstrap level, against the cited source or "
+            "other reputable sources you retrieve yourself (standards bodies, WHO and other "
+            "UN agencies, peer-reviewed studies, established engineering references, "
+            "practitioner organisations). Applied Commons' own pages do not count. Give "
+            "one finding per claim: attribute (what the claim is about, e.g. "
+            "evidence_maturity, validation.built, threshold, hazard), the claim, and a "
+            "verdict: confirmed (a retrieved source says so: give its URL and the page or "
+            "section), unsupported (nothing found either way), contradicted (a source "
+            "says otherwise: give it) or unclear. For an evidence_maturity finding give "
+            "value as E0-E5. For an implementation, supported_maturity is the evidence "
+            "maturity the sources you checked establish (E0 concept, E1 prototype, E2 "
+            "independently replicated, E3 field deployed, E4 established engineering, "
+            "E5 industrial commodity), or null. List hazards and failure modes the "
+            "record misses. recommendation: approve (the claims hold and the hazards are "
+            "covered), revise (say what to change in the summary) or reject (unsafe or "
+            "wrong). List what you could not check. Health and safety material needs "
+            "conservative inference: an unknown stays unknown. " + research._COMMON
+        ),
+        "output_format": (
+            '{"summary": "<one paragraph>", "review": {"recommendation": '
+            '"approve|revise|reject", "summary": "", "findings": [{"attribute": '
+            '"evidence_maturity", "claim": "", "verdict": "confirmed|unsupported|'
+            'contradicted|unclear", "value": "E3", "source_url": "<url>", '
+            '"source_title": "", "locator": "<page or section>", "note": ""}], '
+            '"missing_hazards": [""], "unchecked": [""], "supported_maturity": "E3"}, '
+            '"evidence": [{"source_uri": "<url>", "title": "", "source_type": ""}]}'
+        ),
+    }
+
+
+def store_review(cur, job: dict, result: GraphReviewResult) -> dict[str, Any]:
+    """Record the review against the revision it checked, and its sourced
+    findings as assessments by the reviewer (sources it cites are added)."""
+    payload = job["input"] or {}
+    kind, subject_id = payload.get("subject_type"), payload.get("subject_id")
+    table = {v: k for k, v in NODES.items()}.get(kind)
+    if table is None:
+        raise ValueError("graph-review job without a subject")
+    cur.execute(f"SELECT code FROM {table} WHERE id = %s", (subject_id,))
+    subject = cur.fetchone()
+    if subject is None:
+        return {"review": None, "note": "the record no longer exists"}
+    r = result.review
+    reviewer = f"ac-research worker (graph-review job {job['id']})"
+    maturity = (parse_range(r.supported_maturity, "E", 5) if kind == "implementation"
+                else None) or (None, None)
+    cur.execute(
+        "INSERT INTO graph_reviews (subject_type, subject_id, revision, job_id, reviewer, "
+        "recommendation, summary, findings, missing_hazards, unchecked, supported_maturity_min, "
+        "supported_maturity_max) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
+        "RETURNING id",
+        (kind, subject_id, payload.get("revision") or 0, job["id"], reviewer, r.recommendation,
+         r.summary, Jsonb([f.model_dump() for f in r.findings]), Jsonb(r.missing_hazards),
+         Jsonb(r.unchecked), maturity[0], maturity[1]))
+    review_id = cur.fetchone()["id"]
+    sources, assessments = {}, []
+    for f in r.findings:
+        if f.source_url:
+            host = re.sub(r"^https?://(www\.)?", "", f.source_url).split("/")[0]
+            sources[f.source_url[:200]] = SourceIn(
+                key=f.source_url[:200], family=host or "web", source_type="web",
+                title=f.source_title or f.source_url[:400], uri=f.source_url)
+        state = {"confirmed": "SUPPORTED", "contradicted": "CONFLICTED"}.get(f.verdict, "UNKNOWN")
+        if state == "SUPPORTED" and not f.source_url:
+            state = "INFERRED"
+        value = f.value if f.attribute in RANGES and f.value is not None else f.claim
+        assessments.append(AssessmentIn(
+            subject_type=kind, subject=subject["code"], attribute=f.attribute, value=value,
+            state=state, source=f.source_url[:200] if f.source_url else None,
+            locator=f.locator, basis=f"{f.verdict}: {f.note}"[:1000]))
+    applied = apply_update(cur, GraphUpdate(
+        origin="applied-commons", proposed_by=reviewer, job_id=job["id"],
+        summary=f"Independent review {review_id}: {r.recommendation}",
+        sources=list(sources.values()), assessments=assessments))
+    return {"review": review_id, "recommendation": r.recommendation,
+            "assessments": applied["counts"].get("assessments_created", 0)}

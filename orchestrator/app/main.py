@@ -37,6 +37,7 @@ DEFAULT_JOB_TYPE_OWNERS = {
     "standards-review": "apollo-hermes",
     "safety-review": "apollo-hermes",
     "catalogue-audit": "apollo-hermes",
+    "graph-review": "apollo-hermes",
     "candidate-assessment": "apollo-hermes",
     "literature-collection": "apollo-hermes",
     "source-summarisation": "apollo-hermes",
@@ -880,6 +881,9 @@ def discover_backlog(item: BacklogDiscover):
        it changes (section 4i);
     12. audit: a catalogue-audit job each month, listing gaps against
        reference lists for the maintainer to act on or ignore (section 4j).
+    13. graph reviews: an independent graph-review of each safety-critical
+       or medical capability graph candidate, again when it changes
+       (section 4k).
 
     Every job carries a stable unit key, so repeated runs never enqueue the
     same unit twice; completed or failed units are not re-enqueued. Topics
@@ -901,6 +905,7 @@ def discover_backlog(item: BacklogDiscover):
             progress = _track_progress(cur, item.limit)
             safety = _review_safety(cur, item.limit)
             audited = _audit_catalogue(cur)
+            graph_reviews = _review_graph(cur, item.limit)
         conn.commit()
     return {
         "steered": steered,
@@ -917,6 +922,7 @@ def discover_backlog(item: BacklogDiscover):
         "progress": progress,
         "safety": safety,
         "audit": audited,
+        "graph_reviews": graph_reviews,
     }
 
 
@@ -2641,6 +2647,42 @@ def graph_sources():
             return cur.fetchall()
 
 
+@app.get("/graph/reviews")
+def graph_reviews(limit: int = 100):
+    """Independent reviews of safety-critical and medical candidates,
+    newest first, with the record each one checked."""
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT r.*, COALESCE(n.code, c.code, i.code) AS code, "
+                "COALESCE(n.revision, c.revision, i.revision) AS current_revision "
+                "FROM graph_reviews r "
+                "LEFT JOIN needs n ON r.subject_type = 'need' AND n.id = r.subject_id "
+                "LEFT JOIN capabilities c ON r.subject_type = 'capability' AND c.id = r.subject_id "
+                "LEFT JOIN implementations i ON r.subject_type = 'implementation' "
+                "AND i.id = r.subject_id ORDER BY r.created_at DESC, r.id DESC LIMIT %s",
+                (max(1, min(limit, 500)),))
+            return cur.fetchall()
+
+
+def _review_graph(cur, budget: int) -> list:
+    """A graph-review job for each safety-critical or medical candidate
+    without a review of its current revision (section 4k)."""
+    created = []
+    for kind, row in graph.review_due(cur):
+        if len(created) >= budget:
+            break
+        key = f"{graph.REVIEW}:{kind}:{row['id']}:{row['revision']}"
+        if _unit_exists(cur, key):
+            continue
+        job = _enqueue(cur, unit_key=key, job_type=graph.REVIEW,
+                       priority=graph.REVIEW_PRIORITY,
+                       payload=graph.review_input(cur, kind, row))
+        if job:
+            created.append(job)
+    return created
+
+
 @app.get("/graph/export")
 def graph_export(candidates: bool = False):
     """The approved graph (with candidates if asked) as one document that
@@ -2844,6 +2886,8 @@ def complete_job(job_id: int, item: JobComplete):
                   if job_type == research.SAFETY else None)
         audited = (audit.AuditResult(**item.output)
                    if job_type == audit.AUDIT else None)
+        graph_review = (graph.GraphReviewResult(**item.output)
+                        if job_type == graph.REVIEW else None)
         if assessment is not None:
             # Only an enabler lists the needs it serves (section 2a).
             assessment.serves = list(dict.fromkeys(
@@ -2946,6 +2990,8 @@ def complete_job(job_id: int, item: JobComplete):
                 elif audited is not None:
                     extra = _store_audit(cur, result, audited,
                                          str(item.output.get("summary") or ""))
+                elif graph_review is not None:
+                    extra = graph.store_review(cur, result, graph_review)
                 elif job_type == research.LITERATURE and result["question_id"]:
                     cur.execute(
                         "UPDATE questions SET status = 'answered' "

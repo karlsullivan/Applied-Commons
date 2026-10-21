@@ -2137,3 +2137,76 @@ def test_bootstrap_and_maturity_ranges_parse_or_stay_unknown(client):
     assert graph.parse_range("B3-B1", "B", 7) is None
     assert graph.parse_range("unknown", "B", 7) is None
     assert graph.parse_range(True, "B", 7) is None
+
+
+WOUND_CARE = {
+    "origin": "maintainer", "proposed_by": "Claude Code (claude-opus-5-5)",
+    "capabilities": [{"code": "wound-care", "name": "Wound care"}],
+    "links": [{"capability": "wound-care", "category": "Physical and mental health"}],
+    "implementations": [{"code": "pressure-dressing", "capability": "wound-care",
+                         "name": "Pressure dressing", "pathway": "practice"}]}
+
+
+def review_out(recommendation, *findings, maturity=None):
+    return {"summary": "s", "review": {
+        "recommendation": recommendation, "summary": "Checked against retrieved sources.",
+        "findings": list(findings), "missing_hazards": ["Infection if dressings are reused"],
+        "unchecked": [], "supported_maturity": maturity}}
+
+
+def test_safety_critical_candidates_get_an_independent_review(client):
+    post_graph(client, turning_update())  # nothing safety-critical or medical in it
+    post_graph(client, WOUND_CARE)
+    jobs = discover(client)["graph_reviews"]
+    assert [j["unit_key"].split(":")[1] for j in jobs] == ["capability", "implementation"]
+    assert discover(client)["graph_reviews"] == []
+    job, r = run_job(client, "graph-review", review_out("approve", {
+        "attribute": "Evidence Maturity", "claim": "Established first aid", "verdict": "confirmed",
+        "value": "E4", "source_url": "https://www.who.int/first-aid", "locator": "p. 3"}))
+    assert r.status_code == 200, r.text
+    assert job["input"]["subject_type"] == "capability"
+    assert "independent check" in job["input"]["instructions"]
+    assert job["input"]["record"]["serves"][0]["category"] == "Physical and mental health"
+    # Approval names the review as its independent check.
+    wound = graph_id("capabilities", "wound-care")
+    r = approve(client, "capabilities", wound)
+    assert r.status_code == 200, r.text
+    assert r.json()["independent_check"].startswith("graph-review 1 (job")
+    # Its sourced finding is an assessment from an external source.
+    assert sql("SELECT a.state, s.family, s.origin FROM graph_assessments a JOIN graph_sources s "
+               "ON s.id = a.source_id WHERE a.attribute = 'evidence_maturity'") == [
+        ("SUPPORTED", "who-int", "external")]
+    detail = client.get(f"/graph/capabilities/{wound}").json()
+    assert detail["review"]["recommendation"] == "approve"
+
+    # The implementation's review asks for a revision: no approval on it.
+    job, r = run_job(client, "graph-review", review_out("revise", {
+        "attribute": "hazard", "claim": "Safe for all wounds", "verdict": "contradicted",
+        "source_url": "https://www.ifrc.org/first-aid-guidelines", "note": "not for burns"}, {
+        "attribute": "validation.built", "claim": "Widely used", "verdict": "confirmed"},
+        maturity="E4"))
+    assert r.status_code == 200, r.text
+    dressing = graph_id("implementations", "pressure-dressing")
+    r = approve(client, "implementations", dressing)
+    assert r.status_code == 409 and "recommends revise" in r.json()["detail"]
+    states = dict(sql("SELECT attribute, state FROM graph_assessments WHERE subject_type = "
+                      "'implementation'"))
+    assert states == {"hazard": "CONFLICTED", "validation.built": "INFERRED"}
+    assert sql("SELECT supported_maturity_min FROM graph_reviews WHERE id = 2") == [(4,)]
+    # A revised candidate is reviewed again; the maintainer may also name
+    # another independent check.
+    revised = dict(WOUND_CARE, implementations=[{**WOUND_CARE["implementations"][0],
+                                                  "description": "Not for burns."}])
+    post_graph(client, revised)
+    assert len(discover(client)["graph_reviews"]) == 1
+    r = approve(client, "implementations", dressing, independent_check="Red Cross first aid "
+                "guidelines 2020, checked by the maintainer")
+    assert r.status_code == 200, r.text
+    assert len(client.get("/graph/reviews").json()) == 2
+
+
+def test_a_graph_review_needs_a_valid_recommendation(client):
+    post_graph(client, WOUND_CARE)
+    discover(client)
+    _, r = run_job(client, "graph-review", review_out("maybe"))
+    assert r.status_code == 422
