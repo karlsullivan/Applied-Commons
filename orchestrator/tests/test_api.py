@@ -2238,3 +2238,31 @@ def test_module_results_are_trimmed_not_rejected(client):
                            rationale="Because it is cheap and common.")
     assert len(modular.StandardIn(code="ac-x-std", name="N" * 300, spec="A spec of ten",
                                   rationale="Because it is cheap.").name) == 160
+
+
+def test_a_module_job_sees_the_standards_as_they_are_when_claimed(client):
+    from psycopg.types.json import Jsonb
+
+    screened(10)
+    discover(client)
+    run_job(client, "standards-synthesis", {"summary": "s", "standards": [
+        STANDARD, {**STANDARD, "code": "lora-node", "name": "LoRa sensor node"}]})
+    approve_first_standard(client)
+    discover(client)
+    [(queued,)] = sql("SELECT input FROM jobs WHERE job_type = 'module-synthesis'")
+    assert [s["code"] for s in queued["approved_standards"]] == ["dc-bus-24v"]
+    assert [s["code"] for s in queued["pending_standards"]] == ["lora-node"]
+    # While it waits, the maintainer approves another standard and another
+    # domain's module lands.
+    sql("UPDATE standards SET status = 'approved' WHERE code = 'lora-node'")
+    sql("INSERT INTO modules (code, name, kind, domain, maturity, standards, spec) "
+        "VALUES ('solar-pump', 'Solar pump', 'hardware', 'Energy', 'concept', %s, %s)",
+        Jsonb(["dc-bus-24v"]), Jsonb({"purpose": "Pumps.", "domains": ["Energy"]}))
+    job = claim(client, APOLLO, ["module-synthesis"]).json()["job"]
+    assert [s["code"] for s in job["input"]["approved_standards"]] == ["dc-bus-24v", "lora-node"]
+    assert "pending_standards" not in job["input"]
+    assert [m["code"] for m in job["input"]["existing_modules"]] == ["solar-pump"]
+    assert job["input"]["refreshed_at"].endswith("Z")
+    assert job["input"]["domain"] == "Water"  # the rest of the input is kept
+    [(stored,)] = sql("SELECT input FROM jobs WHERE id = %s", job["id"])
+    assert stored["approved_standards"] == job["input"]["approved_standards"]

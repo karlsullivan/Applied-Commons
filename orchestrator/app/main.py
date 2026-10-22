@@ -1480,19 +1480,9 @@ def _modular_set(cur, budget: int, month: str | None = None) -> list:
                                                   _modules_digest(cur))},
                 priority=modular.REVIEW_PRIORITY)
 
-    cur.execute("SELECT supersedes, code FROM standards "
-                "WHERE status = 'approved' AND supersedes IS NOT NULL")
-    superseded = {r["supersedes"]: r["code"] for r in cur.fetchall()}
-    cur.execute("SELECT code, name, kind, spec, status, decision_note FROM standards "
-                "WHERE status IN ('proposed', 'rejected') ORDER BY code")
-    pending, rejected = [], []
-    for r in cur.fetchall():
-        if r["status"] == "proposed":
-            pending.append({"code": r["code"], "name": r["name"], "kind": r["kind"],
-                            "spec": _clip(r["spec"], 300)})
-        else:
-            rejected.append({"code": r["code"], "name": r["name"],
-                             "why": _clip(r["decision_note"], 200)})
+    context = _standards_context(cur)
+    superseded, pending, rejected = (context["superseded"], context["pending"],
+                                     context["rejected"])
     for category in _focus_categories(cur):
         cur.execute("SELECT count(DISTINCT a.project_id) AS n FROM assessments a "
                     "JOIN projects p ON p.id = a.project_id WHERE p.category_id = %s",
@@ -1546,6 +1536,63 @@ def _modular_set(cur, budget: int, month: str | None = None) -> list:
             **modular.roadmap_input(month, systems, _modules_digest(cur), standards,
                                     previous, sites)})
     return created
+
+
+def _standards_context(cur) -> dict[str, Any]:
+    """The standards a stage 2 job works against: approved ones in full,
+    superseded codes with their successors, and those waiting for the
+    maintainer or turned down (so modules reference rather than duplicate
+    them)."""
+    cur.execute("SELECT supersedes, code FROM standards "
+                "WHERE status = 'approved' AND supersedes IS NOT NULL")
+    superseded = {r["supersedes"]: r["code"] for r in cur.fetchall()}
+    cur.execute("SELECT code, name, kind, spec, status, decision_note FROM standards "
+                "WHERE status IN ('proposed', 'rejected') ORDER BY code")
+    pending, rejected = [], []
+    for r in cur.fetchall():
+        if r["status"] == "proposed":
+            pending.append({"code": r["code"], "name": r["name"], "kind": r["kind"],
+                            "spec": _clip(r["spec"], 300)})
+        else:
+            rejected.append({"code": r["code"], "name": r["name"],
+                             "why": _clip(r["decision_note"], 200)})
+    return {"approved": _standards_digest(cur), "superseded": superseded,
+            "pending": pending, "rejected": rejected}
+
+
+#: Stage 2 jobs whose standards and modules are read again when claimed.
+#: A wave can wait days in the queue, and the maintainer decides standards
+#: meanwhile: the October 2026 module wave was queued with 3 approved
+#: standards, 16 more were approved before it ran, and it proposed
+#: duplicates of them.
+REFRESH_ON_CLAIM = (modular.MODULES, modular.SYSTEMS, modular.ROADMAP)
+
+
+def _refresh_on_claim(cur, job: dict) -> dict:
+    """The job with its standards (and, for modules, the existing modules
+    and the waiting, rejected and superseded standards) as they are now."""
+    if job["job_type"] not in REFRESH_ON_CLAIM:
+        return job
+    context = _standards_context(cur)
+    payload = dict(job["input"] or {})
+    payload["approved_standards"] = context["approved"]
+    if job["job_type"] == modular.MODULES:
+        payload["existing_modules"] = _modules_digest(cur)
+        for key, value in (("pending_standards", context["pending"]),
+                           ("rejected_standards", context["rejected"]),
+                           ("superseded_standards", context["superseded"])):
+            if value:
+                payload[key] = value
+            else:
+                payload.pop(key, None)
+        if not context["superseded"]:
+            payload.pop("superseded_note", None)
+    else:
+        payload["modules"] = _modules_digest(cur)
+    payload["refreshed_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    cur.execute("UPDATE jobs SET input = %s WHERE id = %s RETURNING *",
+                (Jsonb(payload), job["id"]))
+    return cur.fetchone()
 
 
 def _briefs_digest(cur) -> list[dict]:
@@ -2790,6 +2837,8 @@ def claim_job(item: JobClaim):
             )
 
             result = cur.fetchone()
+            if result is not None:
+                result = _refresh_on_claim(cur, result)
 
         conn.commit()
 
