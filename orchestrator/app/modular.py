@@ -27,7 +27,7 @@ from __future__ import annotations
 import hashlib
 import re
 import time
-from typing import Any, Literal
+from typing import Any, ClassVar, Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -107,7 +107,29 @@ def _money(value: Any) -> float | None:
 # ---------------------------------------------------------------------------
 
 
-class _Coded(BaseModel):
+class _Clipped(BaseModel):
+    """Text or lists over their limit are cut, not rejected: one over-long
+    note should not throw away a whole verification (two were lost to a
+    reference note over 600 characters, October 2026), nor hours of module
+    synthesis (three October module results were lost to an interface
+    detail over 500 characters). Fields named in ``unclipped`` keep their
+    limit as a rejection: a standard's spec is what modules are built to,
+    so a cut spec would be worse than none."""
+
+    unclipped: ClassVar[tuple[str, ...]] = ()
+
+    @field_validator("*", mode="before")
+    @classmethod
+    def _clip(cls, value, info):
+        if isinstance(value, (str, list)) and info.field_name not in cls.unclipped:
+            for meta in cls.model_fields[info.field_name].metadata:
+                limit = getattr(meta, "max_length", None)
+                if limit is not None:
+                    return value[:limit]
+        return value
+
+
+class _Coded(_Clipped):
     code: str
     name: str = Field(min_length=3, max_length=160)
 
@@ -121,6 +143,7 @@ class _Coded(BaseModel):
 
 
 class StandardIn(_Coded):
+    unclipped = ("spec",)
     kind: str = "other"
     spec: str = Field(min_length=10, max_length=3000)
     rationale: str = Field(min_length=10, max_length=2000)
@@ -137,24 +160,8 @@ class StandardIn(_Coded):
         return [str(i)[:200] for i in items]
 
 
-class StandardsResult(BaseModel):
+class StandardsResult(_Clipped):
     standards: list[StandardIn] = Field(max_length=10)
-
-
-class _Clipped(BaseModel):
-    """Text or lists over their limit are cut, not rejected: one over-long
-    note should not throw away a whole verification (two were lost to a
-    reference note over 600 characters, October 2026)."""
-
-    @field_validator("*", mode="before")
-    @classmethod
-    def _clip(cls, value, info):
-        if isinstance(value, (str, list)):
-            for meta in cls.model_fields[info.field_name].metadata:
-                limit = getattr(meta, "max_length", None)
-                if limit is not None:
-                    return value[:limit]
-        return value
 
 
 class Reference(_Clipped):
@@ -226,10 +233,16 @@ class VerificationResult(BaseModel):
     verification: Verification
 
 
-class Interface(BaseModel):
+class Interface(_Clipped):
     standard: str
     role: Literal["provides", "consumes"] = "provides"
     detail: str = Field(default="", max_length=500)
+
+    @field_validator("role", mode="before")
+    @classmethod
+    def _role(cls, value):
+        text = str(value or "").strip().lower()
+        return "consumes" if text.startswith(("consum", "use", "input", "draw")) else "provides"
 
     @field_validator("standard")
     @classmethod
@@ -237,7 +250,7 @@ class Interface(BaseModel):
         return slug(value)
 
 
-class BomLine(BaseModel):
+class BomLine(_Clipped):
     part: str = Field(min_length=1, max_length=300)
     quantity: float | str | None = None
     unit_cost_eu: float | None = None
@@ -248,6 +261,19 @@ class BomLine(BaseModel):
     @classmethod
     def _cost(cls, value):
         return _money(value)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _aliases(cls, data):
+        # Models also call the part an item, name or component.
+        if isinstance(data, dict) and not data.get("part"):
+            for key in ("item", "name", "component", "description"):
+                if data.get(key):
+                    data = {**data, "part": data[key]}
+                    break
+        if isinstance(data, dict) and data.get("quantity") is None and "qty" in data:
+            data = {**data, "quantity": data["qty"]}
+        return data
 
 
 class ModuleIn(_Coded):
@@ -278,17 +304,33 @@ class ModuleIn(_Coded):
     def _cost(cls, value):
         return _money(value)
 
+    @field_validator("variants", mode="before")
+    @classmethod
+    def _variant_shapes(cls, value):
+        # A string, a {name: description} object or a list of objects
+        # all mean a list of variants.
+        if value is None:
+            return []
+        if isinstance(value, str):
+            value = [value]
+        elif isinstance(value, dict):
+            value = [f"{k}: {v}" for k, v in value.items()]
+        if not isinstance(value, list):
+            return []
+        return [": ".join(str(x) for x in v.values() if x) if isinstance(v, dict) else v
+                for v in value][:10]
+
     @field_validator("variants")
     @classmethod
     def _variants(cls, items):
         return [str(i)[:500] for i in items]
 
 
-class ModulesResult(BaseModel):
+class ModulesResult(_Clipped):
     modules: list[ModuleIn] = Field(max_length=8)
 
 
-class Calculation(BaseModel):
+class Calculation(_Clipped):
     name: str = Field(min_length=1, max_length=200)
     method: str = Field(default="", max_length=2000)
     inputs: str = Field(default="", max_length=3000)
@@ -302,7 +344,7 @@ class Calculation(BaseModel):
         return _choice(value, ("calculated", "simulated"), "calculated")
 
 
-class SystemModule(BaseModel):
+class SystemModule(_Clipped):
     module: str
     quantity: float | str | None = None
     role: str = Field(default="", max_length=500)
@@ -334,11 +376,11 @@ class SystemIn(_Coded):
         return [str(i)[:600] for i in items]
 
 
-class SystemsResult(BaseModel):
+class SystemsResult(_Clipped):
     systems: list[SystemIn] = Field(min_length=1, max_length=3)
 
 
-class RoadmapStep(BaseModel):
+class RoadmapStep(_Clipped):
     title: str = Field(min_length=3, max_length=300)
     kind: str = "other"
     refs: list[str] = Field(default_factory=list, max_length=20)
@@ -370,7 +412,7 @@ class RoadmapStep(BaseModel):
         return _money(value)
 
 
-class Roadmap(BaseModel):
+class Roadmap(_Clipped):
     summary: str = Field(min_length=20, max_length=6000)
     steps: list[RoadmapStep] = Field(min_length=1, max_length=60)
 
@@ -379,12 +421,12 @@ class RoadmapResult(BaseModel):
     roadmap: Roadmap
 
 
-class Conflict(BaseModel):
+class Conflict(_Clipped):
     finding: str = Field(min_length=5, max_length=800)
     source: str = Field(default="", max_length=300)
 
 
-class StandardReview(BaseModel):
+class StandardReview(_Clipped):
     code: str
     recommendation: str
     rationale: str = Field(min_length=10, max_length=2000)

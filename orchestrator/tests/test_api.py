@@ -2210,3 +2210,31 @@ def test_a_graph_review_needs_a_valid_recommendation(client):
     discover(client)
     _, r = run_job(client, "graph-review", review_out("maybe"))
     assert r.status_code == 422
+
+
+def test_module_results_are_trimmed_not_rejected(client):
+    import modular
+    import pydantic
+
+    long = "x" * 900
+    result = modular.validate(modular.MODULES, {"modules": [{
+        "code": "community-server", "name": "Community server",
+        "purpose": "Runs local dispatch and records for a village.",
+        "interfaces": [{"standard": "ac-dc-bus-elv", "role": "uses", "detail": long}],
+        "variants": {"small": "One board", "large": "A rack"},
+        "bom": [{"item": "Small server", "qty": 1, "unit_cost_eu": 220}],
+    }, {
+        "code": "dispatch-tablet", "name": "Dispatch tablet", "purpose": "Shows the queue to staff.",
+        "variants": [{"name": "rugged", "description": "IP65 case"}, "plain"],
+    }]})
+    first, second = result.modules
+    assert len(first.interfaces[0].detail) == 500 and first.interfaces[0].role == "consumes"
+    assert first.variants == ["small: One board", "large: A rack"]
+    assert first.bom[0].part == "Small server" and first.bom[0].quantity == 1
+    assert second.variants == ["rugged: IP65 case", "plain"]
+    # A standard's spec is still refused when too long, never cut.
+    with pytest.raises(pydantic.ValidationError):
+        modular.StandardIn(code="ac-x-std", name="Some standard", spec="s" * 3500,
+                           rationale="Because it is cheap and common.")
+    assert len(modular.StandardIn(code="ac-x-std", name="N" * 300, spec="A spec of ten",
+                                  rationale="Because it is cheap.").name) == 160
