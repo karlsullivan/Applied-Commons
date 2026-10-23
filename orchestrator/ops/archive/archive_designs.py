@@ -115,6 +115,36 @@ def git_url(url: str) -> str:
     return url
 
 
+#: Matches PROJECT_LICENCE_WEIGHED in the API: once noted, a source the
+#: project's licence could not cover is not offered again.
+PROJECT_LICENCE_WEIGHED = "project licence weighed"
+CODE_HOSTS = ("github.com", "gitlab.com", "codeberg.org", "bitbucket.org", "sourceforge.net")
+
+
+def origin(url: str) -> tuple[str, str]:
+    """Who hosts ``url``: the host, and on a code host the owner account
+    (raw.githubusercontent.com is GitHub)."""
+    parts = urllib.parse.urlsplit(url)
+    host = (parts.hostname or "").lower().removeprefix("www.")
+    if host == "raw.githubusercontent.com":
+        host = "github.com"
+    segments = [s for s in parts.path.split("/") if s]
+    if host in CODE_HOSTS:
+        return host, (segments[0].lower() if segments else "")
+    return host, ""
+
+
+def project_licence_for(item: dict) -> str | None:
+    """The project's own open licence when the project itself hosts this
+    source (same site, or the same owner on a code host); a file merely
+    linked from elsewhere is not covered by it."""
+    licence = item.get("project_licence")
+    if not open_licence(licence):
+        return None
+    mine = {origin(o) for o in item.get("project_origins") or []}
+    return licence if origin(item["source_uri"]) in mine else None
+
+
 def safe_name(text: str, limit: int = 80) -> str:
     return re.sub(r"[^A-Za-z0-9._-]+", "-", text).strip("-.")[:limit] or "file"
 
@@ -176,9 +206,13 @@ def archive_git(item: dict, dest: Path) -> dict:
         if licence is None and open_licence(reported):
             licence = reported
             note += "licence as reported by the build pack (no licence file recognised). "
+        if licence is None and project_licence_for(item):
+            licence = project_licence_for(item)
+            note += "licence of the project, which hosts this repository. "
         if licence is None:
+            weighed = f" ({PROJECT_LICENCE_WEIGHED})" if item.get("project_licence") else ""
             return {"status": "skipped", "resolved_revision": commit, "licence": reported,
-                    "note": note + "no open licence found; kept as a link"}
+                    "note": note + "no open licence found; kept as a link" + weighed}
         dest.mkdir(parents=True, exist_ok=True)
         repo_name = safe_name(url.rstrip("/").split("/")[-1].removesuffix(".git"))
         target = dest / f"{repo_name}-{commit[:12]}.tar.gz"
@@ -196,37 +230,77 @@ class _PublicRedirects(urllib.request.HTTPRedirectHandler):
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
-def archive_file(item: dict, dest: Path) -> dict:
-    url = item["source_uri"]
-    licence = item.get("licence") or "unknown"
-    if not open_licence(licence):
-        return {"status": "skipped", "licence": licence,
-                "note": "no open licence reported; kept as a link"}
-    reason = public_https(url)
-    if reason:
-        return {"status": "skipped", "note": reason}
+USER_AGENT = "Mozilla/5.0 (compatible; AppliedCommonsArchiver/1.0; open design preservation)"
+#: The Internet Archive's latest snapshot of a URL, as originally served.
+WAYBACK = "https://web.archive.org/web/2id_/"
+#: Refusals worth trying the Wayback Machine for: blocked, gone, throttled.
+WAYBACK_CODES = (401, 403, 404, 410, 429, 451)
+
+
+class _TooLarge(Exception):
+    pass
+
+
+def _download(url: str, partial: Path) -> tuple[int, str, str]:
+    """Fetch ``url`` into ``partial``: (bytes, sha256, the URL finally
+    served). Raises _TooLarge past the cap."""
     opener = urllib.request.build_opener(_PublicRedirects())
-    request = urllib.request.Request(url, headers={"User-Agent": "applied-commons-archiver"})
-    dest.mkdir(parents=True, exist_ok=True)
-    partial = dest / ".partial"
+    request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
     digest = hashlib.sha256()
     size = 0
     with opener.open(request, timeout=HTTP_TIMEOUT) as response, partial.open("wb") as out:
         for chunk in iter(lambda: response.read(1 << 20), b""):
             size += len(chunk)
             if size > MAX_FILE_BYTES:
-                out.close()
-                partial.unlink()
-                return {"status": "skipped", "licence": licence,
-                        "note": "file larger than the cap"}
+                raise _TooLarge
             digest.update(chunk)
             out.write(chunk)
-    sha = digest.hexdigest()
+        served = response.geturl()
+    return size, digest.hexdigest(), served
+
+
+def archive_file(item: dict, dest: Path) -> dict:
+    url = item["source_uri"]
+    licence = item.get("licence") or "unknown"
+    note = ""
+    if not open_licence(licence):
+        inherited = project_licence_for(item)
+        if inherited is None:
+            weighed = f" ({PROJECT_LICENCE_WEIGHED})" if item.get("project_licence") else ""
+            return {"status": "skipped", "licence": licence,
+                    "note": "no open licence reported; kept as a link" + weighed}
+        licence = inherited
+        note = "licence of the project, which hosts this file. "
+    reason = public_https(url)
+    if reason:
+        return {"status": "skipped", "note": reason}
+    dest.mkdir(parents=True, exist_ok=True)
+    partial = dest / ".partial"
+    try:
+        try:
+            size, sha, _ = _download(url, partial)
+        except urllib.error.HTTPError as exc:
+            if exc.code not in WAYBACK_CODES:
+                raise
+            # Blocked to servers, or gone: the Internet Archive's copy, if
+            # it has one, is the same file as originally published.
+            try:
+                size, sha, served = _download(WAYBACK + url, partial)
+            except urllib.error.HTTPError:
+                raise exc from None
+            note += (f"the original refused us (HTTP {exc.code}); copied from the Internet "
+                     f"Archive's snapshot {served}. ")
+    except _TooLarge:
+        partial.unlink(missing_ok=True)
+        return {"status": "skipped", "licence": licence, "note": "file larger than the cap"}
+    except BaseException:
+        partial.unlink(missing_ok=True)
+        raise
     base = safe_name(Path(urllib.parse.urlsplit(url).path).name)
     target = dest / f"{sha[:12]}-{base}"
     partial.replace(target)
     return {"status": "archived", "licence": licence, "path": str(target),
-            "bytes": size, "sha256": sha}
+            "bytes": size, "sha256": sha, "note": note.strip()}
 
 
 def _api(method: str, path: str, body: dict | None = None):

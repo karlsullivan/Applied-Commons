@@ -715,6 +715,33 @@ def test_design_sources_are_listed_for_archiving_once(client):
     assert {a["status"] for a in record["archives"]} == {"archived", "failed"}
 
 
+def test_unlicensed_design_files_get_one_more_try_under_the_project_licence(client):
+    from psycopg.types.json import Jsonb
+
+    pid = project(client)
+    design = {"files": [{"name": "Drawing", "uri": "https://example.org/drawing.pdf",
+                         "licence": "unknown"}]}
+    sql("INSERT INTO build_packs (project_id, section, content) VALUES (%s, 'design', %s)",
+        pid, Jsonb(design))
+    client.post("/archives", json={
+        "project_id": pid, "source_uri": "https://example.org/drawing.pdf", "kind": "file",
+        "licence": "unknown", "status": "skipped",
+        "note": "no open licence reported; kept as a link"})
+    assert client.get("/archives/pending").json() == []  # no open project licence: settled
+
+    sql("INSERT INTO source_checks (project_id, licence, licence_class, repository) "
+        "VALUES (%s, 'CC-BY-SA-4.0', 'share-alike', 'https://github.com/example/filter')", pid)
+    [item] = client.get("/archives/pending").json()
+    assert item["project_licence"] == "CC-BY-SA-4.0"
+    assert item["project_origins"][0] == "https://github.com/example/filter"
+
+    client.post("/archives", json={
+        "project_id": pid, "source_uri": "https://example.org/drawing.pdf", "kind": "file",
+        "licence": "unknown", "status": "skipped",
+        "note": "no open licence reported; kept as a link (project licence weighed)"})
+    assert client.get("/archives/pending").json() == []  # weighed once: settled
+
+
 def test_build_instructions_cover_software_projects():
     import research
 

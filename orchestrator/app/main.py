@@ -2188,16 +2188,32 @@ def set_site(item: SiteIn):
     return result
 
 
+#: Written into an archive note once the archiver has considered the
+#: project's own licence for a source without one (see archives_pending).
+PROJECT_LICENCE_WEIGHED = "project licence weighed"
+
+
 @app.get("/archives/pending")
 def archives_pending(limit: int = 20):
     """Design sources from the latest build pack 'design' sections that
-    have no archive record yet (ops/archive/archive-designs.py)."""
+    have no archive record yet (ops/archive/archive-designs.py).
+
+    Each item carries the project's own checked licence when it is open,
+    with the places the project is hosted (its repository and source
+    URLs): a file the project hosts itself, given no licence of its own,
+    is covered by the project's. A source skipped for want of a licence is
+    offered once more when its project's licence is open, until the
+    archiver has weighed that licence (its note says so)."""
     with db() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 """
-                SELECT DISTINCT ON (b.project_id) b.project_id, p.code, b.content
+                SELECT DISTINCT ON (b.project_id) b.project_id, p.code, p.source_uris, b.content,
+                       sc.licence AS project_licence, sc.licence_class, sc.repository
                 FROM build_packs b JOIN projects p ON p.id = b.project_id
+                LEFT JOIN LATERAL (SELECT licence, licence_class, repository FROM source_checks
+                                   WHERE project_id = p.id ORDER BY checked_at DESC LIMIT 1) sc
+                       ON true
                 WHERE b.section = 'design'
                 ORDER BY b.project_id, b.created_at DESC, b.id DESC
                 """
@@ -2206,12 +2222,22 @@ def archives_pending(limit: int = 20):
             # A failed attempt is retried after a day; archived and skipped
             # sources are settled.
             cur.execute(
-                "SELECT project_id, source_uri, revision FROM design_archives "
+                "SELECT project_id, source_uri, revision, status, licence, note "
+                "FROM design_archives "
                 "WHERE status <> 'failed' OR created_at > NOW() - INTERVAL '1 day'")
-            done = {(r["project_id"], r["source_uri"], r["revision"]) for r in cur.fetchall()}
+            rows = cur.fetchall()
+    open_projects = {p["project_id"] for p in packs if p["licence_class"] in ("open", "share-alike")}
+    done = {(r["project_id"], r["source_uri"], r["revision"]) for r in rows
+            if not (r["status"] == "skipped" and r["project_id"] in open_projects
+                    and (r["licence"] or "unknown").lower() in ("unknown", "none", "")
+                    and PROJECT_LICENCE_WEIGHED not in (r["note"] or ""))}
     pending = []
     for pack in packs:
         content = pack["content"] or {}
+        origins = [u for u in [pack["repository"], *(pack["source_uris"] or [])]
+                   if isinstance(u, str) and u.startswith("https://")]
+        project_licence = (pack["project_licence"] if pack["project_id"] in open_projects
+                           else None)
         items = [("git", r.get("url"), r.get("commit") or "", r.get("licence"))
                  for r in content.get("repositories") or []]
         items += [("file", f.get("uri"), "", f.get("licence"))
@@ -2222,7 +2248,8 @@ def archives_pending(limit: int = 20):
             done.add((pack["project_id"], uri, revision))
             pending.append({"project_id": pack["project_id"], "code": pack["code"],
                             "kind": kind, "source_uri": uri, "revision": revision,
-                            "licence": licence or "unknown"})
+                            "licence": licence or "unknown",
+                            "project_licence": project_licence, "project_origins": origins})
             if len(pending) >= limit:
                 return pending
     return pending
