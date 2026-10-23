@@ -688,6 +688,89 @@ def test_steer_build_and_park(client):
     assert client.post(f"/projects/{a}/steer", json={"steer": "maybe"}).status_code == 422
 
 
+def category_id(name="Water"):
+    [(cid,)] = sql("SELECT id FROM need_categories WHERE name = %s", name)
+    return cid
+
+
+def test_a_priority_is_admitted_once_assessed_and_its_jobs_come_first(client, monkeypatch):
+    monkeypatch.setenv("MAX_ACTIVE_PROJECTS", "0")  # no free slots
+    seed_briefs()
+    r = client.post("/projects/suggest", json={
+        "name": "Ceramic Pot Filter", "category_id": category_id(),
+        "summary": "A fired clay filter pot with colloidal silver.",
+        "source_uris": ["https://example.org/pot-filter"], "note": "I want this first"})
+    assert r.status_code == 200 and r.json()["added"] and r.json()["priority"]
+    pid = r.json()["id"]
+    discover(client)
+    # Its assessment is claimed ahead of older, higher-priority work.
+    sql("UPDATE jobs SET created_at = NOW() - INTERVAL '30 days'")
+    other = job(client, "literature-collection", project(client, code="OTHER-1"))
+    sql("UPDATE jobs SET priority = 1.0 WHERE id = %s", other)
+    first = claim(client, APOLLO, ["candidate-assessment", "literature-collection"]).json()["job"]
+    assert first["project_id"] == pid and first["job_type"] == "candidate-assessment"
+    weak = strong_assessment(cost=0.1, ease=0.1, practicality=0.1, effectiveness=0.1)
+    client.post(f"/jobs/{first['id']}/complete", json={"worker": APOLLO, "output": weak})
+    step = discover(client)  # below the threshold and no slots, but admitted
+    assert {"project_id": pid, "admitted": True} in step["prioritised"]
+    assert sql("SELECT status FROM projects WHERE id = %s", pid) == [("active",)]
+    [(author, rationale)] = sql(
+        "SELECT author, rationale FROM decisions WHERE project_id = %s", pid)
+    assert author == "maintainer (priority)" and "I want this first" in rationale
+    [created] = step["created"]  # its research is queued
+    assert created["unit_key"].startswith("literature-collection:question:")
+    assert discover(client)["prioritised"] == []  # admitted once
+    row = next(p for p in client.get("/catalogue").json()["projects"] if p["id"] == pid)
+    assert row["priority"] is True
+    # Clearing it keeps the admission.
+    r = client.post(f"/projects/{pid}/priority", json={"priority": False})
+    assert r.status_code == 200 and r.json()["priority"] is False
+    assert sql("SELECT status FROM projects WHERE id = %s", pid) == [("active",)]
+    assert client.post("/projects/999/priority", json={"priority": True}).status_code == 404
+
+
+def test_suggesting_a_known_project_prioritises_it_instead_of_adding_it(client):
+    seed_briefs()
+    discover(client, limit=1)
+    run_job(client, "candidate-discovery", candidates("Slow Sand Filter"))
+    [(cid,)] = sql("SELECT category_id FROM projects")
+    body = {"name": "slow sand filter", "category_id": cid,
+            "summary": "Biological sand filtration.", "source_uris": ["https://example.org/x"]}
+    r = client.post("/projects/suggest", json=body)
+    assert r.status_code == 200 and not r.json()["added"] and r.json()["priority"]
+    assert sql("SELECT count(*), bool_and(priority) FROM projects") == [(1, True)]
+    assert client.post("/projects/suggest", json={**body, "category_id": 9999}).status_code == 404
+    assert client.post("/projects/suggest", json={
+        **body, "source_uris": ["ftp://x"]}).status_code == 422
+
+
+def test_a_focused_discovery_comes_first_and_picks_its_best_candidate_once(client, monkeypatch):
+    monkeypatch.setenv("MAX_ACTIVE_PROJECTS", "0")
+    seed_briefs()
+    discover(client)  # the periodic scans are queued
+    r = client.post(f"/categories/{category_id()}/discover",
+                    json={"focus": "household rainwater harvesting"})
+    assert r.status_code == 200, r.text
+    again = client.post(f"/categories/{category_id()}/discover",
+                        json={"focus": "household rainwater harvesting"}).json()
+    assert again["id"] == r.json()["id"]
+    first, _ = run_job(client, "candidate-discovery", candidates("Gutter Tank", "Roof Cistern"))
+    assert first["id"] == r.json()["id"]
+    assert "household rainwater harvesting" in first["input"]["instructions"]
+    discover(client)
+    run_job(client, "candidate-assessment", strong_assessment(cost=0.6))
+    assert discover(client)["prioritised"] == []  # waits for every assessment
+    run_job(client, "candidate-assessment", strong_assessment(cost=1.0))
+    step = discover(client)
+    [(best,)] = sql("SELECT project_id FROM assessments ORDER BY composite DESC LIMIT 1")
+    assert {"project_id": best, "picked_by_job": first["id"]} in step["prioritised"]
+    assert {"project_id": best, "admitted": True} in step["prioritised"]
+    assert sql("SELECT id FROM projects WHERE status = 'active'") == [(best,)]
+    client.post(f"/projects/{best}/priority", json={"priority": False})
+    assert discover(client)["prioritised"] == []  # picked once
+    assert client.post("/categories/9999/discover", json={"focus": "x" * 5}).status_code == 404
+
+
 def test_design_sources_are_listed_for_archiving_once(client):
     from psycopg.types.json import Jsonb
 

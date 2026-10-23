@@ -148,6 +148,26 @@ class ProjectSteer(BaseModel):
     note: str = Field(default="", max_length=2000)
 
 
+class ProjectPriority(BaseModel):
+    priority: bool
+    note: str = Field(default="", max_length=2000)
+
+
+class Suggestion(research.Candidate):
+    """A project the maintainer names for a category (policy section 4d)."""
+    category_id: int
+    priority: bool = True
+    note: str = Field(default="", max_length=2000)
+
+
+class FocusedDiscovery(BaseModel):
+    """A discovery the maintainer asks for in a category (section 4d);
+    with ``pick``, its best assessed candidate becomes a priority."""
+    focus: str = Field(min_length=3, max_length=500)
+    note: str = Field(default="", max_length=2000)
+    pick: bool = True
+
+
 class Solved(BaseModel):
     """The maintainer's judgement that a need is substantially solved."""
     solved: bool
@@ -323,6 +343,75 @@ def steer_project(project_id: int, item: ProjectSteer):
     if result is None:
         raise HTTPException(status_code=404, detail="no such project")
     return result
+
+
+@app.post("/projects/{project_id}/priority")
+def prioritise_project(project_id: int, item: ProjectPriority):
+    """Maintainer priority (policy section 4d): a priority project is
+    admitted once assessed, outside the slot limit, and its jobs are claimed
+    first. Clearing it does not undo an admission."""
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE projects SET priority = %s, priority_note = %s,
+                       prioritised_at = CASE WHEN %s THEN NOW() ELSE prioritised_at END
+                WHERE id = %s
+                RETURNING id, code, name, status, priority, priority_note, prioritised_at;
+                """,
+                (item.priority, item.note or None, item.priority, project_id),
+            )
+            result = cur.fetchone()
+        conn.commit()
+    if result is None:
+        raise HTTPException(status_code=404, detail="no such project")
+    return result
+
+
+@app.post("/projects/suggest")
+def suggest_project(item: Suggestion):
+    """A project the maintainer names (policy section 4d). It enters as a
+    candidate and is assessed like a discovered one; a project already in
+    the category under that name is returned (and prioritised if asked)
+    instead of being added twice."""
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT layer, name FROM need_categories WHERE id = %s",
+                        (item.category_id,))
+            category = cur.fetchone()
+            if category is None:
+                raise HTTPException(status_code=404, detail="no such category")
+            cur.execute(
+                """
+                INSERT INTO projects (code, name, maslow_level, domain, status, category_id,
+                                      summary, source_uris, priority, priority_note,
+                                      prioritised_at)
+                VALUES (%s, %s, %s, %s, 'candidate', %s, %s, %s, %s, %s,
+                        CASE WHEN %s THEN NOW() END)
+                ON CONFLICT DO NOTHING
+                RETURNING id, code, name, status, priority;
+                """,
+                (f"c{item.category_id}-{research.slug(item.name)}", item.name,
+                 category["layer"], category["name"], item.category_id, item.summary,
+                 Jsonb(item.source_uris), item.priority, item.note or None, item.priority),
+            )
+            result = cur.fetchone()
+            added = result is not None
+            if not added:
+                cur.execute(
+                    "SELECT id, code, name, status, priority FROM projects "
+                    "WHERE (category_id = %s AND lower(name) = lower(%s)) OR code = %s",
+                    (item.category_id, item.name,
+                     f"c{item.category_id}-{research.slug(item.name)}"))
+                result = cur.fetchone()
+                if result and item.priority and not result["priority"]:
+                    cur.execute(
+                        "UPDATE projects SET priority = TRUE, priority_note = %s, "
+                        "prioritised_at = NOW() WHERE id = %s",
+                        (item.note or None, result["id"]))
+                    result["priority"] = True
+        conn.commit()
+    return {**result, "added": added}
 
 
 # ---------------------------------------------------------------------------
@@ -551,7 +640,7 @@ def _assess_candidates(cur, budget: int) -> list:
         FROM projects p JOIN need_categories c ON c.id = p.category_id
         WHERE p.status = 'candidate'
           AND NOT EXISTS (SELECT 1 FROM assessments a WHERE a.project_id = p.id)
-        ORDER BY p.maslow_level NULLS LAST, p.id
+        ORDER BY p.priority DESC, p.maslow_level NULLS LAST, p.id
         """
     )
     created = []
@@ -636,7 +725,7 @@ def _collect_literature(cur, budget: int) -> list:
                p.name AS project_name, p.maslow_level
         FROM questions q JOIN projects p ON p.id = q.project_id
         WHERE p.status = 'active' AND q.status = 'open'
-        ORDER BY COALESCE(q.priority, 0.5) DESC, q.id
+        ORDER BY p.priority DESC, COALESCE(q.priority, 0.5) DESC, q.id
         """
     )
     created = []
@@ -692,6 +781,63 @@ def _apply_steers(cur) -> list:
         else:
             continue
         applied.append({"project_id": p["id"], "steer": p["steer"]})
+    return applied
+
+
+def _apply_priorities(cur) -> list:
+    """Maintainer priorities (policy section 4d). A focused discovery with
+    pick, once every candidate it found is assessed (or its assessment
+    failed for good), makes its best-scoring one a priority, once. A
+    priority candidate with an assessment is admitted, outside the slot
+    limit and the admission threshold; research and review still decide
+    whether it is built."""
+    applied = []
+    cur.execute(
+        """
+        SELECT j.id, j.input->'maintainer_focus'->>'focus' AS focus,
+               (SELECT p.id FROM projects p JOIN assessments a ON a.project_id = p.id
+                WHERE p.discovered_by_job = j.id AND p.status = 'candidate'
+                ORDER BY a.composite DESC, p.id LIMIT 1) AS best
+        FROM jobs j
+        WHERE j.job_type = %s AND j.status = 'completed'
+          AND (j.input->'maintainer_focus'->>'pick')::boolean
+          AND NOT EXISTS (SELECT 1 FROM projects p WHERE p.discovered_by_job = j.id
+                          AND p.prioritised_at IS NOT NULL)
+          AND NOT EXISTS (
+              SELECT 1 FROM projects p
+              WHERE p.discovered_by_job = j.id
+                AND NOT EXISTS (SELECT 1 FROM assessments a WHERE a.project_id = p.id)
+                AND NOT EXISTS (SELECT 1 FROM jobs aj
+                                WHERE aj.unit_key = %s || p.id AND aj.status = 'failed'))
+        ORDER BY j.id
+        """,
+        (research.DISCOVERY, f"{research.ASSESSMENT}:project:"),
+    )
+    for row in cur.fetchall():
+        if row["best"] is None:
+            continue
+        cur.execute(
+            "UPDATE projects SET priority = TRUE, prioritised_at = NOW(), "
+            "priority_note = %s WHERE id = %s",
+            (f"best assessed candidate of the maintainer's discovery: {row['focus']}"[:2000],
+             row["best"]))
+        applied.append({"project_id": row["best"], "picked_by_job": row["id"]})
+    cur.execute(
+        """
+        SELECT p.id, p.priority_note FROM projects p
+        WHERE p.priority AND p.status = 'candidate'
+          AND EXISTS (SELECT 1 FROM assessments a WHERE a.project_id = p.id)
+        ORDER BY p.prioritised_at, p.id
+        """
+    )
+    for p in cur.fetchall():
+        cur.execute("UPDATE projects SET status = 'active' WHERE id = %s", (p["id"],))
+        cur.execute("UPDATE questions SET status = 'open' "
+                    "WHERE project_id = %s AND status = 'candidate'", (p["id"],))
+        _decide(cur, p["id"], "admit",
+                "maintainer priority" + (f" ({p['priority_note']})" if p["priority_note"] else ""),
+                research.PRIORITY_AUTHOR)
+        applied.append({"project_id": p["id"], "admitted": True})
     return applied
 
 
@@ -762,7 +908,7 @@ def _review_projects(cur, budget: int) -> list:
                 AND NOT EXISTS (SELECT 1 FROM jobs j
                                 WHERE j.unit_key = 'literature-collection:question:' || q.id
                                   AND j.status = 'failed'))
-        ORDER BY p.score DESC NULLS LAST, p.id
+        ORDER BY p.priority DESC, p.score DESC NULLS LAST, p.id
         """
     )
     created = []
@@ -800,7 +946,7 @@ def _build_packs(cur, budget: int) -> list:
         WHERE p.status = 'active'
           AND EXISTS (SELECT 1 FROM decisions d
                       WHERE d.project_id = p.id AND d.decision = 'build')
-        ORDER BY p.score DESC NULLS LAST, p.id
+        ORDER BY p.priority DESC, p.score DESC NULLS LAST, p.id
         """
     )
     created = []
@@ -854,7 +1000,8 @@ def _complete_builds(cur) -> list:
 def discover_backlog(item: BacklogDiscover):
     """Advance the autonomous research pipeline by one bounded step.
 
-    0. steers: apply maintainer overrides (build / park);
+    0. steers: apply maintainer overrides (build / park), then maintainer
+       priorities (admitted once assessed, jobs claimed first);
     1. briefs: one need-brief job per focus-layer need category per
        refresh period;
     2. discovery: one candidate-discovery job per briefed category per
@@ -892,6 +1039,7 @@ def discover_backlog(item: BacklogDiscover):
     with db() as conn:
         with conn.cursor() as cur:
             steered = _apply_steers(cur)
+            prioritised = _apply_priorities(cur)
             briefs = _brief_needs(cur, item.limit)
             discovered = _discover_candidates(cur, item.limit)
             assessed = _assess_candidates(cur, item.limit)
@@ -909,6 +1057,7 @@ def discover_backlog(item: BacklogDiscover):
         conn.commit()
     return {
         "steered": steered,
+        "prioritised": prioritised,
         "briefs": briefs,
         "discovery": discovered,
         "assessment": assessed,
@@ -1078,6 +1227,39 @@ def mark_solved(category_id: int, item: Solved):
             result = cur.fetchone()
         conn.commit()
     return result
+
+
+@app.post("/categories/{category_id}/discover")
+def discover_focus(category_id: int, item: FocusedDiscovery):
+    """A candidate-discovery job the maintainer asks for, focused on one
+    topic in a category and claimed ahead of the queue (section 4d). Asking
+    again for the same topic returns the existing job."""
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id, layer, name, scope, track FROM need_categories "
+                        "WHERE id = %s", (category_id,))
+            category = cur.fetchone()
+            if category is None:
+                raise HTTPException(status_code=404, detail="no such category")
+            key = f"{research.DISCOVERY}:maintainer:{category_id}:{research.slug(item.focus)}"
+            cur.execute("SELECT name FROM projects WHERE category_id = %s ORDER BY id",
+                        (category_id,))
+            known = [r["name"] for r in cur.fetchall()]
+            payload = research.discovery_input(category, known,
+                                               _latest_brief(cur, category_id))
+            payload = {"category_id": category_id, **payload,
+                       "maintainer_focus": {"focus": item.focus, "note": item.note,
+                                            "pick": item.pick},
+                       "instructions": (f"Focus this search on a topic the maintainer "
+                                        f"asked for: {item.focus}. " + payload["instructions"])}
+            job = _enqueue(cur, unit_key=key, job_type=research.DISCOVERY,
+                           priority=1.0, payload=payload)
+            if job is None:
+                cur.execute("SELECT id, job_type, unit_key, priority, status FROM jobs "
+                            "WHERE unit_key = %s", (key,))
+                job = cur.fetchone()
+        conn.commit()
+    return job
 
 
 # ---------------------------------------------------------------------------
@@ -1823,7 +2005,7 @@ def catalogue():
                 f"""
                 SELECT p.id, p.code, p.name, p.status, {_STAGE_SQL} AS stage,
                        p.maslow_level AS layer, c.name AS category, p.score,
-                       p.summary, p.source_uris, p.steer, p.steer_note,
+                       p.summary, p.source_uris, p.steer, p.steer_note, p.priority,
                        COALESCE(c.track, 'need') AS track, p.serves, p.climates,
                        (SELECT d.decision FROM decisions d WHERE d.project_id = p.id
                         ORDER BY d.id DESC LIMIT 1) AS decision,
@@ -1835,7 +2017,7 @@ def catalogue():
                        (SELECT count(DISTINCT b.section) FROM build_packs b
                         WHERE b.project_id = p.id) AS build_sections,
                        GREATEST(
-                           p.created_at, p.steered_at,
+                           p.created_at, p.steered_at, p.prioritised_at,
                            (SELECT max(created_at) FROM decisions WHERE project_id = p.id),
                            (SELECT max(created_at) FROM assessments WHERE project_id = p.id),
                            (SELECT max(created_at) FROM reviews WHERE project_id = p.id),
@@ -1889,7 +2071,7 @@ def project_record(project_id: int):
                 f"""
                 SELECT p.id, p.code, p.name, p.status, {_STAGE_SQL} AS stage,
                        p.maslow_level AS layer, c.name AS category, p.category_id,
-                       p.score, p.summary, p.source_uris, p.steer, p.steer_note,
+                       p.score, p.summary, p.source_uris, p.steer, p.steer_note, p.priority,
                        COALESCE(c.track, 'need') AS track, p.serves, p.climates,
                        p.created_at
                 FROM projects p LEFT JOIN need_categories c ON c.id = p.category_id
@@ -2837,7 +3019,9 @@ def claim_job(item: JobClaim):
                     ORDER BY
                         priority + LEAST(
                             EXTRACT(EPOCH FROM NOW() - created_at) / 86400 * %s, %s
-                        ) DESC,
+                        ) + CASE WHEN input ? 'maintainer_focus'
+                                   OR project_id IN (SELECT id FROM projects WHERE priority)
+                                 THEN 1 ELSE 0 END DESC,
                         created_at ASC
                     FOR UPDATE SKIP LOCKED
                     LIMIT 1

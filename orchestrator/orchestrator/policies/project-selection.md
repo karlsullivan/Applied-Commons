@@ -195,6 +195,8 @@ Design files are kept as pinned local copies (ops/archive/archive_designs.py): a
 
 The maintainer may steer any project: build forces a build pack (admitting a candidate if needed, outside the slot limit), park parks it. A steer is recorded as a decision with author "maintainer (steer)" and acts once; clearing it does not undo what it caused.
 
+Priority (maintainer decision 2026-10-23): the maintainer may make a project a priority, name a project the catalogue lacks (it enters as a candidate and is assessed like a discovered one), or ask for a discovery focused on a topic in a category. A priority project is admitted as soon as it is assessed, outside the slot limit and the admission threshold, with author "maintainer (priority)", and every job for it is taken up before other work. It still goes through research and the go/no-go review, so a priority decides what is worked on first, not what is built. A focused discovery is also taken up first; when asked to, it makes its best-assessed candidate a priority once every candidate it found has been assessed.
+
 4e. The modular set (stage 2)
 
 Applied Commons works in four overlapping stages: (1) understand the needs and what exists (sections 2 to 4d); (2) engineer a modular set from it; (3) field trials and verification at the proving ground; (4) continuous improvement, where trial results revise the set and produce Applied Commons' own improved designs. Stage 2 is modelled on Open Source Ecology's Global Village Construction Set, across every need and enabler.
@@ -390,3 +392,7 @@ Applied Commons' own work is open and may be used commercially: software under G
 Applied Commons adopts the Civilisation Capability Graph (capability-graph.md) as an extension below the categories (section 4k). The Maslow layers, the categories and project selection stay as they are; need, baseline and improvement remain first-class.
 
 Graph candidates are reviewed by an assistant, safety-critical and medical ones also get an independent check, and the maintainer approves them in batches.
+
+2026-10-23:
+
+The maintainer can make projects a priority (section 4d): they are admitted once assessed and their work is taken up first, while research and the go/no-go review still decide whether they are built. First priorities: aquaponics, vertical farming, PAROL6, WikiHouse and Maslow CNC.
