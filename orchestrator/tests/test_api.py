@@ -2423,3 +2423,81 @@ def test_design_sources_are_offered_to_public_archives_and_held_copies_kept(clie
         ("https://github.com/example/filter", "requested"),
         ("https://github.com/example/firmware", "requested")]
     assert client.post("/preservation", json={**held, "service": "dropbox"}).status_code == 422
+
+
+def suggested(client, name, category, uris, priority=False):
+    r = client.post("/projects/suggest", json={
+        "name": name, "category_id": category_id(category), "summary": f"{name} is open.",
+        "source_uris": uris, "priority": priority})
+    assert r.status_code == 200, r.text
+    return r.json()["id"]
+
+
+def test_a_merged_duplicate_hands_its_needs_sources_and_relations_to_the_survivor(client):
+    keep = suggested(client, "OpenMRS", "Computing and open data",
+                     ["https://github.com/openmrs/openmrs-core"])
+    dup = suggested(client, "OpenMRS EMR", "Physical and mental health",
+                    ["https://openmrs.org", "https://github.com/openmrs/openmrs-core"],
+                    priority=True)
+    other = suggested(client, "Bahmni", "Physical and mental health",
+                      ["https://github.com/Bahmni/openmrs-module-bahmniapps"])
+    sql("INSERT INTO project_relations (a, b, kind, why) VALUES (%s, %s, 'alternative', 'x'), "
+        "(%s, %s, 'alternative', 'y')", min(dup, other), max(dup, other), keep, dup)
+    queued = job(client, "literature-collection", dup)
+    r = client.post(f"/projects/{dup}/merge", json={
+        "into": keep, "category_id": category_id("Physical and mental health"),
+        "note": "same system"})
+    assert r.status_code == 200, r.text
+    assert r.json() == {"id": dup, "merged_into": keep, "stopped_jobs": [queued]}
+    assert sql("SELECT status, error FROM jobs WHERE id = %s", queued) == [
+        ("failed", f"project merged into #{keep}")]
+    [(status, merged_into)] = sql("SELECT status, merged_into FROM projects WHERE id = %s", dup)
+    assert (status, merged_into) == ("merged", keep)
+    rows = {p["id"]: p for p in client.get("/catalogue").json()["projects"]}
+    assert dup not in rows
+    survivor = rows[keep]
+    # The better-fitting category is now its own; the earlier one is kept.
+    assert survivor["category"] == "Physical and mental health"
+    assert survivor["also_in"] == ["Computing and open data"]
+    assert survivor["merged"] == [{"id": dup, "code": "c9-openmrs-emr", "name": "OpenMRS EMR"}]
+    assert survivor["source_uris"] == ["https://github.com/openmrs/openmrs-core",
+                                       "https://openmrs.org"]
+    assert survivor["priority"] is True and survivor["layer"] == 2
+    assert sql("SELECT a, b FROM project_relations ORDER BY a") == [
+        (min(keep, other), max(keep, other))]  # the relation moved, the self-relation went
+    [(author, rationale)] = sql(
+        "SELECT author, rationale FROM decisions WHERE project_id = %s", dup)
+    assert author == "maintainer (merge)" and "same system" in rationale
+    assert client.post(f"/projects/{dup}/merge", json={"into": keep}).status_code == 409
+    assert client.post(f"/projects/{keep}/merge", json={"into": keep}).status_code == 422
+    assert client.post(f"/projects/{keep}/merge", json={"into": 999}).status_code == 404
+
+
+def test_discovery_lists_a_known_project_under_another_need_instead_of_adding_it(client):
+    seed_briefs()
+    discover(client, limit=2)
+    first, _ = run_job(client, "candidate-discovery", {"summary": "s", "candidates": [
+        {"name": "Ushahidi", "summary": "Crisis mapping platform.",
+         "source_uris": ["https://github.com/ushahidi/platform"]}]})
+    second, r = run_job(client, "candidate-discovery", {"summary": "s", "candidates": [
+        {"name": "Ushahidi (crisis reports)", "summary": "Crowd reports.",
+         "source_uris": ["https://github.com/ushahidi/Platform.git"]},
+        {"name": "Sahana Eden", "summary": "Disaster management.",
+         "source_uris": ["https://github.com/sahana/eden"]}]})
+    assert r.status_code == 200, r.text
+    assert sql("SELECT name FROM projects ORDER BY id") == [("Ushahidi",), ("Sahana Eden",)]
+    [(also,)] = sql("SELECT category_id FROM project_categories")
+    assert also == second["input"]["category_id"] != first["input"]["category_id"]
+    # Discovery in that category now knows it.
+    with psycopg.connect(DB_URL) as conn:
+        from psycopg.rows import dict_row
+        conn.row_factory = dict_row
+        import main
+        assert "Ushahidi" in main._known_names(conn.cursor(), also)
+
+
+def test_identity_keys():
+    import main
+    assert main.identity_keys("ODK (Open Data Kit)", ["https://github.com/getodk/Central.git"]) == {
+        "name:odk", "repo:github.com/getodk/central"}
+    assert main.identity_keys("ODK", []) == {"name:odk"}

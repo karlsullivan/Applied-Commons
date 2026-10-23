@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import time
 from datetime import datetime
 from typing import Any
@@ -166,6 +167,15 @@ class FocusedDiscovery(BaseModel):
     focus: str = Field(min_length=3, max_length=500)
     note: str = Field(default="", max_length=2000)
     pick: bool = True
+
+
+class ProjectMerge(BaseModel):
+    """Merge a duplicate into the project that replaces it (section 4d);
+    ``category_id`` optionally moves the survivor to a better-fitting
+    primary category."""
+    into: int
+    category_id: int | None = None
+    note: str = Field(default="", max_length=2000)
 
 
 class Solved(BaseModel):
@@ -424,6 +434,104 @@ def suggest_project(item: Suggestion):
     return {**result, "added": added}
 
 
+#: A project listed under a category: its own, or one it was also listed
+#: under (project_categories). Format with the project alias and the
+#: category placeholder or column.
+IN_CATEGORY = ("({p}.category_id = {c} OR EXISTS (SELECT 1 FROM project_categories pc "
+               "WHERE pc.project_id = {p}.id AND pc.category_id = {c}))")
+
+
+def _also_list(cur, project_id, category_id, reason) -> None:
+    """List a project under another category too (not its own)."""
+    cur.execute(
+        "INSERT INTO project_categories (project_id, category_id, reason) "
+        "SELECT %s, %s, %s WHERE NOT EXISTS (SELECT 1 FROM projects "
+        "WHERE id = %s AND category_id = %s) ON CONFLICT DO NOTHING",
+        (project_id, category_id, reason[:2000], project_id, category_id))
+
+
+@app.post("/projects/{project_id}/merge")
+def merge_project(project_id: int, item: ProjectMerge):
+    """Merge a duplicate project into the one that replaces it (policy
+    section 4d). The duplicate keeps its records, with status 'merged';
+    the survivor is listed under the duplicate's categories too, gains its
+    sources, relations, priority and the more basic of their layers, and
+    the duplicate's queued jobs are stopped."""
+    if item.into == project_id:
+        raise HTTPException(status_code=422, detail="a project cannot be merged into itself")
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM projects WHERE id = ANY(%s) FOR UPDATE",
+                        ([project_id, item.into],))
+            rows = {r["id"]: r for r in cur.fetchall()}
+            dup, keep = rows.get(project_id), rows.get(item.into)
+            if dup is None or keep is None:
+                raise HTTPException(status_code=404, detail="no such project")
+            if dup["merged_into"] or keep["merged_into"]:
+                raise HTTPException(status_code=409, detail="already merged")
+            reason = f"merged from #{dup['id']} {dup['name']}"
+            if item.category_id is not None and item.category_id != keep["category_id"]:
+                cur.execute("SELECT id, layer, name FROM need_categories WHERE id = %s",
+                            (item.category_id,))
+                category = cur.fetchone()
+                if category is None:
+                    raise HTTPException(status_code=404, detail="no such category")
+                earlier = keep["category_id"]
+                cur.execute("DELETE FROM project_categories WHERE project_id = %s "
+                            "AND category_id = %s", (keep["id"], category["id"]))
+                cur.execute("UPDATE projects SET category_id = %s, domain = %s, "
+                            "maslow_level = LEAST(maslow_level, COALESCE(%s, maslow_level)) "
+                            "WHERE id = %s",
+                            (category["id"], category["name"], category["layer"], keep["id"]))
+                keep["category_id"] = category["id"]
+                if earlier:
+                    _also_list(cur, keep["id"], earlier, "its earlier primary category")
+            if dup["category_id"]:
+                _also_list(cur, keep["id"], dup["category_id"], reason)
+            cur.execute("SELECT category_id FROM project_categories WHERE project_id = %s",
+                        (dup["id"],))
+            for row in cur.fetchall():
+                _also_list(cur, keep["id"], row["category_id"], reason)
+            sources = list(dict.fromkeys(list(keep["source_uris"] or [])
+                                         + list(dup["source_uris"] or [])))
+            serves = list(dict.fromkeys(list(keep["serves"] or []) + list(dup["serves"] or [])))
+            cur.execute(
+                "UPDATE projects SET source_uris = %s, serves = %s, "
+                "maslow_level = LEAST(maslow_level, %s), "
+                "priority = priority OR %s, "
+                "prioritised_at = COALESCE(prioritised_at, %s) WHERE id = %s",
+                (Jsonb(sources), Jsonb(serves) if serves or keep["serves"] is not None else None,
+                 dup["maslow_level"], dup["priority"], dup["prioritised_at"], keep["id"]))
+            cur.execute("UPDATE projects SET merged_into = %s WHERE merged_into = %s",
+                        (keep["id"], dup["id"]))
+            # Relations move to the survivor, minus any it now has with itself
+            # or already holds.
+            cur.execute("DELETE FROM project_relations r WHERE (r.a = %(d)s AND r.b = %(k)s) "
+                        "OR (r.a = %(k)s AND r.b = %(d)s)", {"d": dup["id"], "k": keep["id"]})
+            for col, other in (("a", "b"), ("b", "a")):
+                cur.execute(
+                    f"DELETE FROM project_relations r WHERE r.{col} = %(d)s AND EXISTS ("
+                    f"SELECT 1 FROM project_relations s WHERE s.{col} = %(k)s "
+                    f"AND s.{other} = r.{other} AND s.kind = r.kind)",
+                    {"d": dup["id"], "k": keep["id"]})
+                cur.execute(f"UPDATE project_relations SET {col} = %s WHERE {col} = %s",
+                            (keep["id"], dup["id"]))
+            cur.execute(
+                "UPDATE jobs SET status = 'failed', error = %s, completed_at = NOW(), "
+                "lease_until = NULL WHERE project_id = %s AND status = 'queued' "
+                "RETURNING id",
+                (f"project merged into #{keep['id']}", dup["id"]))
+            stopped = [r["id"] for r in cur.fetchall()]
+            cur.execute("UPDATE projects SET status = 'merged', merged_into = %s, "
+                        "merged_at = NOW(), priority = FALSE WHERE id = %s",
+                        (keep["id"], dup["id"]))
+            _decide(cur, dup["id"], "merge",
+                    f"merged into #{keep['id']} {keep['name']}"
+                    + (f" ({item.note})" if item.note else ""), research.MERGE_AUTHOR)
+        conn.commit()
+    return {"id": dup["id"], "merged_into": keep["id"], "stopped_jobs": stopped}
+
+
 # ---------------------------------------------------------------------------
 # Questions
 # ---------------------------------------------------------------------------
@@ -596,6 +704,19 @@ def _brief_needs(cur, budget: int) -> list:
     return created
 
 
+def _known_names(cur, category_id) -> list[str]:
+    """Names discovery skips in a category: the projects listed under it
+    (its own and those also listed there) and the duplicates merged into
+    them."""
+    listed = IN_CATEGORY.format(p="p", c="%(c)s")
+    cur.execute(
+        f"SELECT p.id, p.name FROM projects p WHERE {listed} "
+        f"UNION SELECT m.id, m.name FROM projects m JOIN projects p ON p.id = m.merged_into "
+        f"WHERE {listed} ORDER BY 1",
+        {"c": category_id})
+    return list(dict.fromkeys(r["name"] for r in cur.fetchall()))
+
+
 def _discover_candidates(cur, budget: int) -> list:
     """Stage 1: scan each briefed focus-layer need category once per
     period."""
@@ -624,11 +745,7 @@ def _discover_candidates(cur, budget: int) -> list:
         brief = _latest_brief(cur, category["id"])
         if brief is None:
             continue
-        cur.execute(
-            "SELECT name FROM projects WHERE category_id = %s ORDER BY id",
-            (category["id"],),
-        )
-        known = [r["name"] for r in cur.fetchall()]
+        known = _known_names(cur, category["id"])
         payload = {"category_id": category["id"],
                    **research.discovery_input(category, known, brief)}
         priority = (research.ENABLER_DISCOVERY_PRIORITY
@@ -1107,6 +1224,7 @@ def _relate_projects(cur, month: str | None = None) -> list:
                c.name AS category, COALESCE(c.track, 'need') AS track
         FROM projects p JOIN assessments a ON a.project_id = p.id
         LEFT JOIN need_categories c ON c.id = p.category_id
+        WHERE p.status <> 'merged'
         ORDER BY p.id
         """
     )
@@ -1252,9 +1370,7 @@ def discover_focus(category_id: int, item: FocusedDiscovery):
             if category is None:
                 raise HTTPException(status_code=404, detail="no such category")
             key = f"{research.DISCOVERY}:maintainer:{category_id}:{research.slug(item.focus)}"
-            cur.execute("SELECT name FROM projects WHERE category_id = %s ORDER BY id",
-                        (category_id,))
-            known = [r["name"] for r in cur.fetchall()]
+            known = _known_names(cur, category_id)
             payload = research.discovery_input(category, known,
                                                _latest_brief(cur, category_id))
             payload = {"category_id": category_id, **payload,
@@ -1289,11 +1405,14 @@ def _progress_facts(cur, category) -> tuple[list, list, list]:
         FROM projects p
         LEFT JOIN LATERAL (SELECT licence_class FROM source_checks WHERE project_id = p.id
                            ORDER BY checked_at DESC, id DESC LIMIT 1) sc ON TRUE
-        WHERE (p.category_id = %s OR p.serves ? %s)
+        WHERE (p.category_id = %s OR p.serves ? %s OR EXISTS (
+                   SELECT 1 FROM project_categories pc
+                   WHERE pc.project_id = p.id AND pc.category_id = %s))
+          AND p.status <> 'merged'
           AND EXISTS (SELECT 1 FROM assessments a WHERE a.project_id = p.id)
         ORDER BY p.score DESC NULLS LAST, p.id LIMIT 60
         """,
-        (category["id"], category["name"]),
+        (category["id"], category["name"], category["id"]),
     )
     projects = [{"code": r["code"], "name": r["name"], "stage": r["stage"],
                  "build_pack_complete": r["status"] == "completed",
@@ -1514,10 +1633,12 @@ def _projects_digest(cur, category_id=None, limit=120, detail=False) -> list[dic
         LEFT JOIN LATERAL (SELECT licence, licence_class FROM source_checks
                            WHERE project_id = p.id
                            ORDER BY checked_at DESC, id DESC LIMIT 1) sc ON TRUE
-        WHERE (%s::bigint IS NULL OR p.category_id = %s::bigint)
+        WHERE p.status <> 'merged' AND (%s::bigint IS NULL OR p.category_id = %s::bigint
+               OR EXISTS (SELECT 1 FROM project_categories pc
+                          WHERE pc.project_id = p.id AND pc.category_id = %s::bigint))
         ORDER BY p.id, a.created_at DESC
         """,
-        (category_id, category_id),
+        (category_id, category_id, category_id),
     )
     rows = sorted(cur.fetchall(), key=lambda r: -(r["score"] or 0))[:limit]
     out = []
@@ -1677,8 +1798,9 @@ def _modular_set(cur, budget: int, month: str | None = None) -> list:
                                      context["rejected"])
     for category in _focus_categories(cur):
         cur.execute("SELECT count(DISTINCT a.project_id) AS n FROM assessments a "
-                    "JOIN projects p ON p.id = a.project_id WHERE p.category_id = %s",
-                    (category["id"],))
+                    "JOIN projects p ON p.id = a.project_id WHERE p.status <> 'merged' AND "
+                    + IN_CATEGORY.format(p="p", c="%(c)s"),
+                    {"c": category["id"]})
         if cur.fetchone()["n"] < modular.MIN_ASSESSED_PER_DOMAIN:
             continue
         key = f"{modular.MODULES}:category:{category['id']}:{month}"
@@ -1896,8 +2018,9 @@ def _store_modular(cur, job, result) -> dict:
         return {"reviews": stored, "revisions": revisions}
 
     if job_type == modular.MODULES:
-        cur.execute("SELECT id, lower(name) AS name FROM projects WHERE category_id = %s",
-                    (inp.get("category_id"),))
+        cur.execute("SELECT p.id, lower(p.name) AS name FROM projects p WHERE "
+                    "p.status <> 'merged' AND " + IN_CATEGORY.format(p="p", c="%(c)s"),
+                    {"c": inp.get("category_id")})
         by_name = {r["name"]: r["id"] for r in cur.fetchall()}
         for m in result.modules:
             for s in m.new_standards:
@@ -1977,6 +2100,7 @@ def portfolio():
                        (SELECT count(*) FROM questions q WHERE q.project_id = p.id) AS questions,
                        (SELECT count(*) FROM findings f WHERE f.project_id = p.id) AS findings
                 FROM projects p LEFT JOIN need_categories c ON c.id = p.category_id
+                WHERE p.status <> 'merged'
                 ORDER BY (p.status = 'active') DESC, p.score DESC NULLS LAST, p.id
                 """
             )
@@ -1992,6 +2116,7 @@ def portfolio():
 #: Catalogue stage of a project, from its status and decisions.
 _STAGE_SQL = """
     CASE
+        WHEN p.status = 'merged' THEN 'merged'
         WHEN p.status = 'parked' THEN 'parked'
         WHEN p.status = 'completed' THEN 'built'
         WHEN p.status = 'active' AND EXISTS (
@@ -2034,8 +2159,17 @@ def catalogue():
                            (SELECT max(created_at) FROM findings WHERE project_id = p.id),
                            (SELECT max(created_at) FROM build_packs WHERE project_id = p.id),
                            (SELECT max(created_at) FROM design_archives WHERE project_id = p.id),
-                           (SELECT max(created_at) FROM questions WHERE project_id = p.id)
+                           (SELECT max(created_at) FROM questions WHERE project_id = p.id),
+                           (SELECT max(added_at) FROM project_categories WHERE project_id = p.id)
                        ) AS updated_at,
+                       (SELECT COALESCE(jsonb_agg(c2.name ORDER BY c2.layer NULLS LAST, c2.name),
+                                        '[]'::jsonb)
+                        FROM project_categories pc JOIN need_categories c2 ON c2.id = pc.category_id
+                        WHERE pc.project_id = p.id) AS also_in,
+                       (SELECT COALESCE(jsonb_agg(jsonb_build_object(
+                                   'id', m.id, 'code', m.code, 'name', m.name) ORDER BY m.id),
+                                        '[]'::jsonb)
+                        FROM projects m WHERE m.merged_into = p.id) AS merged,
                        sc.licence, COALESCE(sc.licence_class, 'unchecked') AS licence_class,
                        sc.last_activity, sc.archived AS repository_archived,
                        sc.checked_at AS sources_checked_at,
@@ -2046,6 +2180,7 @@ def catalogue():
                 FROM projects p LEFT JOIN need_categories c ON c.id = p.category_id
                 LEFT JOIN LATERAL (SELECT * FROM source_checks WHERE project_id = p.id
                                    ORDER BY checked_at DESC, id DESC LIMIT 1) sc ON TRUE
+                WHERE p.status <> 'merged'
                 ORDER BY p.maslow_level, c.name, p.score DESC NULLS LAST, p.id
                 """
             )
@@ -2082,6 +2217,7 @@ def project_record(project_id: int):
                 SELECT p.id, p.code, p.name, p.status, {_STAGE_SQL} AS stage,
                        p.maslow_level AS layer, c.name AS category, p.category_id,
                        p.score, p.summary, p.source_uris, p.steer, p.steer_note, p.priority,
+                       p.merged_into,
                        COALESCE(c.track, 'need') AS track, p.serves, p.climates,
                        p.created_at
                 FROM projects p LEFT JOIN need_categories c ON c.id = p.category_id
@@ -2804,7 +2940,8 @@ def _audit_catalogue(cur, month: str | None = None) -> list:
         (list(research.DISCOVERY_LAYERS), research.ENABLER),
     )
     rows = cur.fetchall()
-    cur.execute("SELECT category_id, status, count(*) AS n FROM projects GROUP BY 1, 2")
+    cur.execute("SELECT category_id, status, count(*) AS n FROM projects "
+                "WHERE status <> 'merged' GROUP BY 1, 2")
     counts: dict = {}
     for r in cur.fetchall():
         counts.setdefault(r["category_id"], {})[r["status"]] = r["n"]
@@ -2915,9 +3052,7 @@ def decide_gap(gap_id: int, item: Decision):
                 cur.execute("SELECT id, layer, name, scope, track FROM need_categories "
                             "WHERE id = %s", (gap["category_id"],))
                 category = cur.fetchone()
-                cur.execute("SELECT name FROM projects WHERE category_id = %s ORDER BY id",
-                            (category["id"],))
-                known = [r["name"] for r in cur.fetchall()]
+                known = _known_names(cur, category["id"])
                 payload = {"category_id": category["id"],
                            **research.discovery_input(category, known,
                                                       _latest_brief(cur, category["id"]))}
@@ -3376,12 +3511,63 @@ def complete_job(job_id: int, item: JobComplete):
     }
 
 
+_CODE_REPO = re.compile(r"^https?://(?:www\.)?(github\.com|gitlab\.com|codeberg\.org)/"
+                        r"([^/#?]+)/([^/#?]+)", re.I)
+
+
+def identity_keys(name: str, uris) -> set[str]:
+    """What identifies a project across categories: its name without
+    bracketed asides, punctuation or case, and each code-host repository
+    it cites."""
+    plain = re.sub(r"[^a-z0-9]+", "", re.sub(r"\(.*?\)", " ", str(name).lower()))
+    keys = {f"name:{plain}"} if plain else set()
+    for uri in uris or []:
+        found = _CODE_REPO.match(str(uri))
+        if found:
+            host, owner, repo = (g.lower() for g in found.groups())
+            keys.add(f"repo:{host}/{owner}/{repo.removesuffix('.git')}")
+    return keys
+
+
+def _known_identities(cur) -> dict[str, int]:
+    """Identity key -> the project that now carries it (a merged duplicate
+    resolves to its survivor)."""
+    cur.execute("SELECT id, name, source_uris, merged_into FROM projects")
+    rows = cur.fetchall()
+    survivor = {r["id"]: r["merged_into"] for r in rows}
+
+    def resolve(pid):
+        for _ in range(10):
+            if not survivor.get(pid):
+                return pid
+            pid = survivor[pid]
+        return pid
+    known: dict[str, int] = {}
+    for r in sorted(rows, key=lambda r: r["id"]):
+        for key in identity_keys(r["name"], r["source_uris"]):
+            known.setdefault(key, resolve(r["id"]))
+    return known
+
+
 def _store_candidates(cur, job, discovery) -> dict:
+    """New candidates from a discovery. A project already catalogued under
+    another category (same name or repository) is listed under this one
+    too instead of being added twice (section 4d)."""
     category_id = job["input"]["category_id"]
     cur.execute("SELECT layer, name FROM need_categories WHERE id = %s", (category_id,))
     category = cur.fetchone()
-    added = 0
+    known = _known_identities(cur)
+    added = also = 0
     for candidate in discovery.candidates:
+        keys = identity_keys(candidate.name, candidate.source_uris)
+        existing = next((known[k] for k in sorted(keys) if k in known), None)
+        if existing is not None:
+            cur.execute("SELECT category_id FROM projects WHERE id = %s", (existing,))
+            if cur.fetchone()["category_id"] != category_id:
+                _also_list(cur, existing, category_id,
+                           f"found again by discovery job {job['id']} as {candidate.name}")
+                also += 1
+            continue
         cur.execute(
             """
             INSERT INTO projects (code, name, maslow_level, domain, status,
@@ -3394,8 +3580,12 @@ def _store_candidates(cur, job, discovery) -> dict:
              category["layer"], category["name"], category_id, candidate.summary,
              Jsonb(candidate.source_uris), job["id"]),
         )
-        added += cur.fetchone() is not None
-    return {"candidates": added}
+        row = cur.fetchone()
+        if row is not None:
+            added += 1
+            for key in keys:
+                known.setdefault(key, row["id"])
+    return {"candidates": added, "also_listed": also}
 
 
 def _store_assessment(cur, job, assessment) -> dict:

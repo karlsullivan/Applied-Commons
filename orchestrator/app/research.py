@@ -22,6 +22,7 @@ DECISION_AUTHOR = "applied-commons orchestrator, rubric v1"
 REVIEW_AUTHOR = "applied-commons orchestrator, review v1"
 STEER_AUTHOR = "maintainer (steer)"
 PRIORITY_AUTHOR = "maintainer (priority)"
+MERGE_AUTHOR = "maintainer (merge)"
 
 #: Pipeline job types (all executed by Apollo through Hermes).
 NEED_BRIEF = "need-brief"
