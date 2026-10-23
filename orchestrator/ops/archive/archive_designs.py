@@ -36,6 +36,7 @@ import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
+from datetime import datetime, timezone
 from pathlib import Path
 
 API = os.environ.get("AC_API_URL", "http://127.0.0.1:8100")
@@ -303,6 +304,153 @@ def archive_file(item: dict, dest: Path) -> dict:
             "bytes": size, "sha256": sha, "note": note.strip()}
 
 
+# ---------------------------------------------------------------------------
+# Public preservation: Software Heritage for repositories, the Wayback
+# Machine for files and pages (GET /preservation/pending, POST /preservation)
+# ---------------------------------------------------------------------------
+
+SWH = os.environ.get("AC_SWH_API", "https://archive.softwareheritage.org/api/1")
+WAYBACK_AVAILABLE = os.environ.get("AC_WAYBACK_AVAILABLE",
+                                   "https://archive.org/wayback/available?url=")
+WAYBACK_SAVE = os.environ.get("AC_WAYBACK_SAVE", "https://web.archive.org/save/")
+PRESERVE_BATCH = int(os.environ.get("AC_PRESERVE_BATCH", "15"))
+#: A Wayback snapshot older than this is saved again.
+FRESH_DAYS = 365
+#: Stop asking Software Heritage below this many requests left in the hour.
+SWH_RESERVE = 20
+SAVE_TIMEOUT = 180
+SHA1 = re.compile(r"^[0-9a-f]{40}$")
+SNAPSHOT_PATH = re.compile(r"/web/(\d{14})/")
+
+
+class _Throttled(Exception):
+    """The service asked us to slow down: stop using it for this pass."""
+
+
+def _get_json(url: str, method: str = "GET", timeout: int = HTTP_TIMEOUT):
+    """(HTTP status, parsed body or None, headers). 429 raises _Throttled."""
+    request = urllib.request.Request(url, method=method, headers={
+        "User-Agent": USER_AGENT, "Accept": "application/json"})
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            body = response.read()
+            return response.status, json.loads(body) if body else None, response.headers
+    except urllib.error.HTTPError as exc:
+        if exc.code == 429:
+            raise _Throttled(url) from None
+        return exc.code, None, exc.headers
+
+
+def swh_origin(url: str) -> str:
+    """The origin URL Software Heritage files a repository under."""
+    return git_url(url).rstrip("/").removesuffix(".git")
+
+
+def _swh_budget(headers) -> None:
+    remaining = (headers or {}).get("X-RateLimit-Remaining")
+    if remaining is not None and remaining.isdigit() and int(remaining) < SWH_RESERVE:
+        raise _Throttled("Software Heritage rate limit")
+
+
+def preserve_git(item: dict) -> dict:
+    """Software Heritage's copy of a repository: the pinned commit when it
+    holds it, else its latest snapshot of the origin; otherwise a save is
+    requested and checked again later."""
+    origin = swh_origin(item["source_uri"])
+    revision = (item.get("revision") or "").lower()
+    if SHA1.match(revision):
+        status, _, headers = _get_json(f"{SWH}/revision/{revision}/")
+        _swh_budget(headers)
+        if status == 200:
+            return {"status": "held", "reference": f"swh:1:rev:{revision};origin={origin}",
+                    "note": "the pinned commit is archived"}
+    status, visit, headers = _get_json(
+        f"{SWH}/origin/{origin}/visit/latest/?require_snapshot=true")
+    _swh_budget(headers)
+    snapshot = visit.get("snapshot") if status == 200 and visit else None
+    latest = ({"reference": f"swh:1:snp:{snapshot};origin={origin}",
+               "captured_at": visit.get("date")} if snapshot else {})
+    pinned = bool(SHA1.match(revision))
+    if snapshot and (not pinned or item.get("last_status") == "requested"):
+        note = ("latest snapshot; the pinned commit is not in it" if pinned
+                else "latest snapshot of the repository")
+        return {"status": "held", **latest, "note": note}
+    status, save, headers = _get_json(f"{SWH}/origin/save/git/url/{origin}/", method="POST")
+    _swh_budget(headers)
+    if status == 200 and save and save.get("save_request_status") != "rejected":
+        return {"status": "requested", **latest,
+                "note": f"save requested ({save.get('save_task_status') or 'pending'})"}
+    reason = (save or {}).get("save_request_status") or f"HTTP {status}"
+    return {"status": "failed", **latest, "note": f"Software Heritage save refused: {reason}"}
+
+
+def _wayback_time(stamp: str) -> datetime | None:
+    try:
+        return datetime.strptime(stamp, "%Y%m%d%H%M%S").replace(tzinfo=timezone.utc)
+    except (TypeError, ValueError):
+        return None
+
+
+def _wayback_ref(stamp: str, url: str) -> dict:
+    when = _wayback_time(stamp)
+    return {"reference": f"https://web.archive.org/web/{stamp}/{url}",
+            "captured_at": when.isoformat() if when else None}
+
+
+def preserve_file(item: dict) -> dict:
+    """The Wayback Machine's copy of a file or page: a snapshot from the
+    last FRESH_DAYS, or else a new one saved now."""
+    url = item["source_uri"]
+    _, data, _ = _get_json(WAYBACK_AVAILABLE + urllib.parse.quote(url, safe=""))
+    closest = ((data or {}).get("archived_snapshots") or {}).get("closest") or {}
+    stamp = (closest.get("timestamp") or "") if closest.get("available") else ""
+    when = _wayback_time(stamp)
+    if when and (datetime.now(timezone.utc) - when).days <= FRESH_DAYS:
+        return {"status": "held", **_wayback_ref(stamp, url), "note": "existing snapshot"}
+    older = {"status": "held", **_wayback_ref(stamp, url)} if when else None
+    request = urllib.request.Request(WAYBACK_SAVE + url, headers={"User-Agent": USER_AGENT})
+    try:
+        with urllib.request.urlopen(request, timeout=SAVE_TIMEOUT) as response:
+            served = response.geturl() + " " + (response.headers.get("Content-Location") or "")
+    except urllib.error.HTTPError as exc:
+        if exc.code == 429:
+            raise _Throttled(url) from None
+        if older:
+            return {**older, "note": f"snapshot over a year old; a new save failed (HTTP {exc.code})"}
+        return {"status": "failed", "note": f"Wayback save failed: HTTP {exc.code}"}
+    found = SNAPSHOT_PATH.search(served)
+    if found:
+        return {"status": "held", **_wayback_ref(found.group(1), url), "note": "saved now"}
+    if older:
+        return {**older, "note": "snapshot over a year old; a new save was requested"}
+    return {"status": "requested", "note": "Wayback save requested"}
+
+
+def preserve() -> dict[str, int]:
+    """One preservation pass. A throttled service is left for the next
+    pass; one failing source does not stop the batch."""
+    counts: dict[str, int] = {}
+    throttled: set[str] = set()
+    for item in _api("GET", f"/preservation/pending?limit={PRESERVE_BATCH}"):
+        service = item["service"]
+        if service in throttled:
+            continue
+        try:
+            outcome = (preserve_git if service == "software-heritage" else preserve_file)(item)
+        except _Throttled as exc:
+            print(f"throttled by {service} ({exc}); the rest waits for the next pass")
+            throttled.add(service)
+            continue
+        except Exception as exc:  # recorded, not raised
+            outcome = {"status": "failed", "note": f"{type(exc).__name__}: {exc}"[:2000]}
+        _api("POST", "/preservation", {"source_uri": item["source_uri"], "service": service,
+                                       **outcome})
+        counts[outcome["status"]] = counts.get(outcome["status"], 0) + 1
+        print(f"{service} {outcome['status']}: {item['source_uri']} "
+              f"{outcome.get('reference') or ''} {outcome.get('note', '')}")
+    return counts
+
+
 def _api(method: str, path: str, body: dict | None = None):
     data = json.dumps(body).encode() if body is not None else None
     request = urllib.request.Request(API + path, data=data, method=method,
@@ -331,6 +479,8 @@ def run() -> int:
         counts[record["status"]] = counts.get(record["status"], 0) + 1
         print(f"{record['status']}: {item['code']} {item['source_uri']} {record.get('note', '')}")
     print("archive pass:", counts or "nothing pending")
+    if PRESERVE_BATCH > 0:
+        print("preservation pass:", preserve() or "nothing pending")
     return 0
 
 

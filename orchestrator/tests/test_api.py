@@ -43,7 +43,7 @@ def clean(client):
         conn.execute(
             "TRUNCATE jobs, findings, evidence, questions, projects, sites, modules, "
             "systems, standards, roadmaps, graph_updates, graph_sources, needs, "
-            "capabilities, graph_assessments RESTART IDENTITY CASCADE"
+            "capabilities, graph_assessments, design_preservation RESTART IDENTITY CASCADE"
         )
         conn.execute("UPDATE need_categories SET solved_at = NULL, solved_note = NULL")
     yield
@@ -2376,3 +2376,50 @@ def test_a_module_job_sees_the_standards_as_they_are_when_claimed(client):
     assert job["input"]["domain"] == "Water"  # the rest of the input is kept
     [(stored,)] = sql("SELECT input FROM jobs WHERE id = %s", job["id"])
     assert stored["approved_standards"] == job["input"]["approved_standards"]
+
+
+def test_design_sources_are_offered_to_public_archives_and_held_copies_kept(client):
+    from psycopg.types.json import Jsonb
+
+    pid = project(client)
+    sql("INSERT INTO build_packs (project_id, section, content) VALUES (%s, 'design', %s)",
+        pid, Jsonb(BUILD["design"]))
+    sql("INSERT INTO source_checks (project_id, licence, licence_class, repository) "
+        "VALUES (%s, 'MIT', 'open', 'https://github.com/example/filter')", pid)
+    sql("INSERT INTO source_checks (project_id, licence, licence_class, repository) "
+        "VALUES (%s, 'MIT', 'open', 'https://github.com/example/firmware')", pid)
+    client.post("/archives", json={
+        "project_id": pid, "source_uri": "https://github.com/example/filter", "kind": "git",
+        "revision": "abc123", "resolved_revision": "abc123" + "0" * 34, "licence": "MIT",
+        "status": "archived", "path": "/x.tar.gz", "bytes": 10, "sha256": "a" * 64})
+    client.post("/archives", json={
+        "project_id": pid, "source_uri": "https://example.org/drawing.pdf", "kind": "file",
+        "status": "skipped", "note": "no open licence reported; kept as a link"})
+    pending = client.get("/preservation/pending").json()
+    # The skipped file (no local copy) first; the archived repository with its commit.
+    assert [(p["source_uri"], p["service"]) for p in pending] == [
+        ("https://example.org/drawing.pdf", "wayback"),
+        ("https://github.com/example/firmware", "software-heritage"),
+        ("https://github.com/example/filter", "software-heritage")]
+    assert pending[2]["revision"] == "abc123" + "0" * 34
+    held = {"source_uri": "https://example.org/drawing.pdf", "service": "wayback",
+            "status": "held", "reference": "https://web.archive.org/web/20261023000000/x",
+            "captured_at": "2026-10-23T00:00:00Z"}
+    assert client.post("/preservation", json=held).json()["status"] == "held"
+    # A later failed check does not lose the copy.
+    r = client.post("/preservation", json={**held, "status": "failed", "reference": None,
+                                           "note": "HTTP 520"}).json()
+    assert r["status"] == "held" and r["reference"].endswith("/x")
+    for uri in ("https://github.com/example/firmware", "https://github.com/example/filter"):
+        client.post("/preservation", json={"source_uri": uri, "service": "software-heritage",
+                                           "status": "requested"})
+    assert client.get("/preservation/pending").json() == []
+    sql("UPDATE design_preservation SET checked_at = NOW() - INTERVAL '7 hours' "
+        "WHERE status = 'requested'")
+    assert len(client.get("/preservation/pending").json()) == 2  # checked again
+    record = client.get(f"/projects/{pid}/record").json()
+    assert [(p["source_uri"], p["status"]) for p in record["preservation"]] == [
+        ("https://example.org/drawing.pdf", "held"),
+        ("https://github.com/example/filter", "requested"),
+        ("https://github.com/example/firmware", "requested")]
+    assert client.post("/preservation", json={**held, "service": "dropbox"}).status_code == 422

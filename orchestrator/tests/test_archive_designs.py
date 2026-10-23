@@ -111,3 +111,154 @@ def test_a_server_error_is_not_sent_to_the_wayback_machine(tmp_path, monkeypatch
     with pytest.raises(urllib.error.HTTPError):
         ad.archive_file({"source_uri": "https://x.example/a", "licence": "MIT"}, tmp_path)
     assert calls == ["https://x.example/a"]
+
+
+# ---------------------------------------------------------------------------
+# Public preservation (Software Heritage, the Wayback Machine)
+# ---------------------------------------------------------------------------
+
+SNP = "e828f259885e241176ef813d8cc34b8c0094fcfc"
+REV = "a" * 40
+
+
+def swh(monkeypatch, answers, remaining="600"):
+    """Answer _get_json from {url fragment: (status, body)}; record calls."""
+    calls = []
+
+    def get_json(url, method="GET", timeout=None):
+        calls.append((method, url))
+        for fragment, (status, body) in answers.items():
+            if fragment in url:
+                return status, body, {"X-RateLimit-Remaining": remaining}
+        return 404, None, {"X-RateLimit-Remaining": remaining}
+    monkeypatch.setattr(ad, "_get_json", get_json)
+    return calls
+
+
+def test_swh_origin_is_the_repository_without_dot_git():
+    assert ad.swh_origin("https://github.com/o/r/tree/main/cad") == "https://github.com/o/r"
+    assert ad.swh_origin("https://codeberg.org/o/r.git/") == "https://codeberg.org/o/r"
+
+
+def test_a_pinned_commit_held_by_software_heritage_is_cited_by_swhid(monkeypatch):
+    swh(monkeypatch, {f"/revision/{REV}/": (200, {"id": REV})})
+    out = ad.preserve_git({"source_uri": "https://github.com/o/r", "revision": REV})
+    assert out["status"] == "held"
+    assert out["reference"] == f"swh:1:rev:{REV};origin=https://github.com/o/r"
+
+
+def test_a_repository_held_by_software_heritage_cites_its_latest_snapshot(monkeypatch):
+    calls = swh(monkeypatch, {"/visit/latest/": (200, {"snapshot": SNP, "date": "2026-06-08T04:35:40+00:00"})})
+    out = ad.preserve_git({"source_uri": "https://github.com/o/r.git", "revision": "main"})
+    assert out == {"status": "held", "reference": f"swh:1:snp:{SNP};origin=https://github.com/o/r",
+                   "captured_at": "2026-06-08T04:35:40+00:00",
+                   "note": "latest snapshot of the repository"}
+    assert not any(method == "POST" for method, _ in calls)
+
+
+def test_an_unknown_repository_gets_a_save_request(monkeypatch):
+    calls = swh(monkeypatch, {"/origin/save/git/url/": (200, {"save_request_status": "accepted",
+                                                              "save_task_status": "pending"})})
+    out = ad.preserve_git({"source_uri": "https://github.com/o/r", "revision": ""})
+    assert out == {"status": "requested", "note": "save requested (pending)"}
+    assert ("POST", f"{ad.SWH}/origin/save/git/url/https://github.com/o/r/") in calls
+    swh(monkeypatch, {"/origin/save/git/url/": (200, {"save_request_status": "rejected"})})
+    out = ad.preserve_git({"source_uri": "https://example.org/r.git"})
+    assert out["status"] == "failed" and "rejected" in out["note"]
+
+
+def test_a_missing_pinned_commit_is_requested_once_then_the_snapshot_is_held(monkeypatch):
+    answers = {"/visit/latest/": (200, {"snapshot": SNP, "date": "2026-01-01T00:00:00+00:00"}),
+               "/origin/save/git/url/": (200, {"save_request_status": "accepted"})}
+    swh(monkeypatch, answers)
+    item = {"source_uri": "https://github.com/o/r", "revision": REV}
+    first = ad.preserve_git(item)
+    assert first["status"] == "requested" and first["reference"].startswith("swh:1:snp:")
+    again = ad.preserve_git({**item, "last_status": "requested"})
+    assert again["status"] == "held" and "not in it" in again["note"]
+
+
+def test_software_heritage_is_left_alone_near_its_rate_limit(monkeypatch):
+    swh(monkeypatch, {}, remaining="5")
+    try:
+        ad.preserve_git({"source_uri": "https://github.com/o/r"})
+    except ad._Throttled:
+        pass
+    else:
+        raise AssertionError("expected _Throttled")
+
+
+class _Saved:
+    def __init__(self, url, location=""):
+        self.url, self.headers = url, {"Content-Location": location}
+
+    def geturl(self):
+        return self.url
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+def wayback(monkeypatch, stamp, save):
+    closest = {"available": True, "timestamp": stamp} if stamp else {}
+    swh(monkeypatch, {"wayback/available": (200, {"archived_snapshots": {"closest": closest}})})
+    saved = []
+
+    def urlopen(request, timeout=None):
+        saved.append(request.full_url)
+        if isinstance(save, Exception):
+            raise save
+        return save
+    monkeypatch.setattr(ad.urllib.request, "urlopen", urlopen)
+    return saved
+
+
+def test_a_recent_wayback_snapshot_is_held_without_saving(monkeypatch):
+    from datetime import datetime, timezone
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+    saved = wayback(monkeypatch, stamp, None)
+    out = ad.preserve_file({"source_uri": "https://example.org/a.pdf"})
+    assert out["status"] == "held" and saved == []
+    assert out["reference"] == f"https://web.archive.org/web/{stamp}/https://example.org/a.pdf"
+
+
+def test_an_old_or_missing_snapshot_is_saved_now(monkeypatch):
+    url = "https://example.org/a.pdf"
+    saved = wayback(monkeypatch, "20190101000000",
+                    _Saved(f"https://web.archive.org/web/20261023031500/{url}"))
+    out = ad.preserve_file({"source_uri": url})
+    assert saved == [ad.WAYBACK_SAVE + url]
+    assert out["status"] == "held" and out["note"] == "saved now"
+    assert out["reference"].endswith(f"/web/20261023031500/{url}")
+    assert out["captured_at"].startswith("2026-10-23T03:15:00")
+    # The save fails: the old snapshot is still a copy.
+    import urllib.error
+    wayback(monkeypatch, "20190101000000", urllib.error.HTTPError(url, 520, "x", {}, None))
+    out = ad.preserve_file({"source_uri": url})
+    assert out["status"] == "held" and "/web/20190101000000/" in out["reference"]
+    wayback(monkeypatch, "", urllib.error.HTTPError(url, 520, "x", {}, None))
+    assert ad.preserve_file({"source_uri": url})["status"] == "failed"
+
+
+def test_a_throttled_service_waits_while_the_other_carries_on(monkeypatch):
+    pending = [{"source_uri": "https://github.com/o/a", "service": "software-heritage"},
+               {"source_uri": "https://github.com/o/b", "service": "software-heritage"},
+               {"source_uri": "https://example.org/c.pdf", "service": "wayback"}]
+    posted = []
+
+    def api(method, path, body=None):
+        if method == "GET":
+            return pending
+        posted.append(body)
+        return {}
+    monkeypatch.setattr(ad, "_api", api)
+
+    def throttled(item):
+        raise ad._Throttled("limit")
+    monkeypatch.setattr(ad, "preserve_git", throttled)
+    monkeypatch.setattr(ad, "preserve_file", lambda item: {"status": "held", "reference": "r"})
+    assert ad.preserve() == {"held": 1}
+    assert [p["source_uri"] for p in posted] == ["https://example.org/c.pdf"]

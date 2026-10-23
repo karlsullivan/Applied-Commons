@@ -224,6 +224,16 @@ class ArchiveRecord(BaseModel):
     note: str = Field(default="", max_length=2000)
 
 
+class PreservationRecord(BaseModel):
+    """A public archive's copy of a design source (section 4c)."""
+    source_uri: str = Field(pattern=r"^https://", max_length=2000)
+    service: str = Field(pattern="^(software-heritage|wayback)$")
+    status: str = Field(pattern="^(held|requested|failed)$")
+    reference: str | None = Field(default=None, max_length=2000)
+    captured_at: datetime | None = None
+    note: str = Field(default="", max_length=2000)
+
+
 class LinkCheck(BaseModel):
     url: str = Field(max_length=2000)
     state: str = Field(pattern="^(ok|broken|blocked|unreachable|skipped)$")
@@ -2124,6 +2134,13 @@ def project_record(project_id: int):
                     "SELECT source_uri, kind, revision, resolved_revision, licence, "
                     "status, path, bytes, sha256, note, created_at "
                     "FROM design_archives WHERE project_id = %s ORDER BY id"),
+                "preservation": rows(
+                    "WITH me AS (SELECT %s::bigint AS id) "
+                    "SELECT source_uri, service, status, reference, captured_at, checked_at "
+                    "FROM design_preservation WHERE source_uri IN ("
+                    "SELECT source_uri FROM design_archives WHERE project_id = (SELECT id FROM me) "
+                    "UNION SELECT repository FROM source_checks "
+                    "WHERE project_id = (SELECT id FROM me)) ORDER BY source_uri, service"),
                 "check": next(iter(rows(
                     "SELECT links, licence, licence_class, licence_source, repository, "
                     "last_activity, archived, checked_at FROM source_checks "
@@ -2458,6 +2475,90 @@ def record_archive(item: ArchiveRecord):
                 (item.project_id, item.source_uri, item.kind, item.revision,
                  item.resolved_revision, item.licence, item.status, item.path,
                  item.bytes, item.sha256, item.note),
+            )
+            result = cur.fetchone()
+        conn.commit()
+    return result
+
+
+#: Public archives (section 4c): a repository goes to Software Heritage,
+#: a file or page to the Wayback Machine.
+PRESERVATION_SERVICE = "CASE WHEN {kind} = 'git' THEN 'software-heritage' ELSE 'wayback' END"
+
+
+@app.get("/preservation/pending")
+def preservation_pending(limit: int = 20):
+    """Design sources (every source the archiver has seen, and the
+    repositories of projects with a design section) due a public-archive
+    check: never checked, a save requested over 6 hours ago, a failure
+    over a day ago, or held but last checked over 90 days ago. Sources
+    with no local copy come first, since a public archive is all that
+    keeps them."""
+    service = PRESERVATION_SERVICE.format(kind="d.kind")
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                WITH sources AS (
+                    (SELECT DISTINCT ON (source_uri) source_uri, kind,
+                            COALESCE(resolved_revision, NULLIF(revision, '')) AS revision,
+                            status <> 'archived' AS at_risk
+                     FROM design_archives ORDER BY source_uri, created_at DESC)
+                    UNION ALL
+                    (SELECT DISTINCT ON (sc.repository) sc.repository, 'git', NULL, TRUE
+                     FROM source_checks sc
+                     WHERE sc.repository LIKE 'https://%%'
+                       AND EXISTS (SELECT 1 FROM build_packs b WHERE b.project_id = sc.project_id
+                                   AND b.section = 'design')
+                     ORDER BY sc.repository, sc.checked_at DESC)
+                ), d AS (
+                    SELECT DISTINCT ON (source_uri) * FROM sources
+                    ORDER BY source_uri, revision NULLS LAST, at_risk
+                )
+                SELECT d.source_uri, d.kind, d.revision, {service} AS service,
+                       p.status AS last_status, p.reference AS last_reference
+                FROM d LEFT JOIN design_preservation p
+                  ON p.source_uri = d.source_uri AND p.service = {service}
+                WHERE p.id IS NULL
+                   OR (p.status = 'requested' AND p.checked_at < NOW() - INTERVAL '6 hours')
+                   OR (p.status = 'failed' AND p.checked_at < NOW() - INTERVAL '1 day')
+                   OR (p.status = 'held' AND p.checked_at < NOW() - INTERVAL '90 days')
+                ORDER BY (p.id IS NOT NULL), d.at_risk DESC, d.source_uri
+                LIMIT %s
+                """,
+                (limit,),
+            )
+            return cur.fetchall()
+
+
+@app.post("/preservation")
+def record_preservation(item: PreservationRecord):
+    """Record a public archive's copy of a design source. A copy already
+    held stays recorded when a later check fails or is only requested."""
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO design_preservation (source_uri, service, status, reference,
+                                                 captured_at, note)
+                VALUES (%s, %s, %s, %s, %s, %s)
+                ON CONFLICT (source_uri, service) DO UPDATE SET
+                    status = CASE WHEN design_preservation.status = 'held'
+                                   AND EXCLUDED.status <> 'held'
+                                  THEN 'held' ELSE EXCLUDED.status END,
+                    reference = CASE WHEN design_preservation.status = 'held'
+                                      AND EXCLUDED.status <> 'held'
+                                     THEN design_preservation.reference
+                                     ELSE EXCLUDED.reference END,
+                    captured_at = CASE WHEN design_preservation.status = 'held'
+                                        AND EXCLUDED.status <> 'held'
+                                       THEN design_preservation.captured_at
+                                       ELSE EXCLUDED.captured_at END,
+                    note = EXCLUDED.note, checked_at = NOW()
+                RETURNING id, status, reference;
+                """,
+                (item.source_uri, item.service, item.status, item.reference,
+                 item.captured_at, item.note or None),
             )
             result = cur.fetchone()
         conn.commit()
