@@ -71,14 +71,30 @@ OPEN_TEXT = (
 LICENCE_FILE = re.compile(r"^(LICEN[CS]E|COPYING|COPYRIGHT)([.-].*)?$", re.I)
 
 
+#: Licences that forbid commercial use or changes are not open (policy
+#: section 9: open means modification and commercial use are allowed).
+RESTRICTED = re.compile(
+    r"\bNC\b|non[- ]?commercial|\bND\b|no[- ]?deriv|proprietary|all rights reserved|"
+    r"\bunknown\b|\bnone\b", re.I)
+
+
 def open_licence(name: str | None) -> bool:
-    return bool(name) and bool(OPEN_NAME.search(name)) and not re.search(
-        r"\b(proprietary|all rights reserved|unknown|none)\b", name, re.I)
+    if not name or RESTRICTED.search(name.replace("-", " ").replace("_", " ")):
+        return False
+    if re.fullmatch(r"(CC|Creative Commons)( licen[cs]e)?", name.strip(), re.I):
+        return False  # which Creative Commons licence is not said
+    return bool(OPEN_NAME.search(name))
 
 
 def licence_from_text(text: str) -> str | None:
     for name, pattern in OPEN_TEXT:
         if pattern.search(text):
+            if name == "CC":  # only the open Creative Commons licences
+                if re.search(r"NonCommercial|NoDerivatives|NoDerivs|\bBY[- ]N[CD]\b", text, re.I):
+                    return None
+                return "CC-BY-SA" if re.search(r"ShareAlike|BY[- ]SA", text, re.I) else (
+                    "CC0" if re.search(r"\bCC0\b|Public Domain Dedication", text, re.I) else
+                    "CC-BY" if re.search(r"Attribution", text, re.I) else None)
             return name
     return None
 

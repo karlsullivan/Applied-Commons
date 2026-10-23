@@ -262,3 +262,16 @@ def test_a_throttled_service_waits_while_the_other_carries_on(monkeypatch):
     monkeypatch.setattr(ad, "preserve_file", lambda item: {"status": "held", "reference": "r"})
     assert ad.preserve() == {"held": 1}
     assert [p["source_uri"] for p in posted] == ["https://example.org/c.pdf"]
+
+
+def test_non_commercial_and_no_derivatives_licences_are_not_open():
+    for name in ("CC-BY-NC", "CC-BY-NC-SA-4.0", "CC BY-ND 4.0", "CC", "Creative Commons",
+                 "Creative Commons Attribution-NonCommercial 4.0"):
+        assert not ad.open_licence(name), name
+    for name in ("CC-BY-4.0", "CC-BY-SA", "CC0-1.0", "MIT AND GPL-3.0-only",
+                 "public domain (RWSN specification)"):
+        assert ad.open_licence(name), name
+    assert ad.licence_from_text(
+        "Creative Commons Attribution-NonCommercial-ShareAlike 4.0") is None
+    assert ad.licence_from_text("Creative Commons Attribution-ShareAlike 4.0") == "CC-BY-SA"
+    assert ad.licence_from_text("Creative Commons Attribution 4.0 International") == "CC-BY"
