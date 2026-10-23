@@ -272,6 +272,48 @@ def test_non_commercial_and_no_derivatives_licences_are_not_open():
                  "public domain (RWSN specification)"):
         assert ad.open_licence(name), name
     assert ad.licence_from_text(
-        "Creative Commons Attribution-NonCommercial-ShareAlike 4.0") is None
+        "Creative Commons Attribution-NonCommercial-ShareAlike 4.0") == "CC-BY-NC-SA"
+    assert ad.licence_from_text("Creative Commons Attribution-NonCommercial 4.0") == "CC-BY-NC"
+    assert ad.licence_from_text(
+        "Creative Commons Attribution-NonCommercial-NoDerivatives 4.0") is None
     assert ad.licence_from_text("Creative Commons Attribution-ShareAlike 4.0") == "CC-BY-SA"
     assert ad.licence_from_text("Creative Commons Attribution 4.0 International") == "CC-BY"
+
+
+def test_non_commercial_copies_are_kept_but_not_open():
+    for name in ("CC-BY-NC", "CC-BY-NC-SA-4.0", "Creative Commons Attribution-NonCommercial 4.0",
+                 "CC BY-NC 4.0"):
+        assert ad.non_commercial(name) and ad.archivable(name) and not ad.open_licence(name), name
+    for name in ("CC BY-NC-ND 4.0", "CC BY-ND", "Non-commercial use only", "NC", "unknown", None):
+        assert not ad.archivable(name), name
+    assert ad.archivable("MIT") and not ad.non_commercial("MIT")
+
+
+def test_a_non_commercial_file_is_archived_and_a_bare_skip_says_nc_was_weighed(
+        tmp_path, monkeypatch):
+    _fake_download(monkeypatch, ["https://maker.org/a.pdf"])
+    out = ad.archive_file({"source_uri": "https://maker.org/a.pdf",
+                           "licence": "CC BY-NC-SA 4.0"}, tmp_path)
+    assert out["status"] == "archived" and out["licence"] == "CC BY-NC-SA 4.0"
+    out = ad.archive_file({"source_uri": "https://maker.org/b.pdf",
+                           "licence": "CC BY-NC-ND 4.0"}, tmp_path)
+    assert out["status"] == "skipped" and ad.NON_COMMERCIAL_WEIGHED in out["note"]
+
+
+def test_an_archived_non_commercial_copy_is_noted_as_such(monkeypatch, tmp_path):
+    posted = []
+    item = {"project_id": 1, "code": "X", "kind": "file", "revision": "",
+            "source_uri": "https://maker.org/a.pdf", "licence": "CC BY-NC 4.0"}
+
+    def api(method, path, body=None):
+        if method == "GET":
+            return [item]
+        posted.append(body)
+        return {}
+    monkeypatch.setattr(ad, "_api", api)
+    monkeypatch.setattr(ad, "EXPORTS", tmp_path)
+    monkeypatch.setattr(ad, "PRESERVE_BATCH", 0)
+    monkeypatch.setattr(ad, "archive_file", lambda item, dest: {
+        "status": "archived", "licence": item["licence"], "path": "/x", "note": ""})
+    ad.run()
+    assert posted[0]["note"].startswith("non-commercial licence: a preservation copy")

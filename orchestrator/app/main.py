@@ -256,7 +256,8 @@ class SourceCheck(BaseModel):
     """One check of a project's sources (ops/checks/check_sources.py)."""
     links: list[LinkCheck] = Field(default_factory=list, max_length=40)
     licence: str | None = Field(default=None, max_length=200)
-    licence_class: str = Field(pattern="^(open|share-alike|restricted|none|unknown)$")
+    licence_class: str = Field(
+        pattern="^(open|share-alike|non-commercial|restricted|none|unknown)$")
     licence_source: str | None = Field(default=None, max_length=200)
     repository: str | None = Field(default=None, max_length=2000)
     last_activity: datetime | None = None
@@ -1720,7 +1721,9 @@ def _modules_digest(cur, limit=150) -> list[dict]:
              "maturity": r["maturity"], "purpose": _clip(r["spec"].get("purpose"), 240),
              "interfaces": [{"standard": i.get("standard"), "role": i.get("role")}
                             for i in r["spec"].get("interfaces", [])],
-             "cost_eu": r["cost_eu"], "cost_low_income": r["cost_low_income"]}
+             "cost_eu": r["cost_eu"], "cost_low_income": r["cost_low_income"],
+             **({"non_commercial": True, "licence": r["spec"].get("licence")}
+                if r["spec"].get("non_commercial") else {})}
             for r in cur.fetchall()]
 
 
@@ -2018,16 +2021,26 @@ def _store_modular(cur, job, result) -> dict:
         return {"reviews": stored, "revisions": revisions}
 
     if job_type == modular.MODULES:
-        cur.execute("SELECT p.id, lower(p.name) AS name FROM projects p WHERE "
-                    "p.status <> 'merged' AND " + IN_CATEGORY.format(p="p", c="%(c)s"),
+        cur.execute("SELECT p.id, p.name, sc.licence, sc.licence_class FROM projects p "
+                    "LEFT JOIN LATERAL (SELECT licence, licence_class FROM source_checks "
+                    "WHERE project_id = p.id ORDER BY checked_at DESC, id DESC LIMIT 1) sc "
+                    "ON TRUE WHERE p.status <> 'merged' AND "
+                    + IN_CATEGORY.format(p="p", c="%(c)s"),
                     {"c": inp.get("category_id")})
-        by_name = {r["name"]: r["id"] for r in cur.fetchall()}
+        by_name = {r["name"].lower(): r for r in cur.fetchall()}
+        stored, refused = 0, []
         for m in result.modules:
+            sources = [by_name[n.lower()] for n in m.source_projects if n.lower() in by_name]
+            # Licence terms are decided here, from the source checks, not
+            # taken on the model's word (policy section 9).
+            terms = modular.module_terms(m.licence, m.licence_note, sources)
+            if "refused" in terms:
+                refused.append({"code": m.code, "reason": terms["refused"]})
+                continue
             for s in m.new_standards:
                 _upsert_standard(cur, job_id, s)
-            projects = sorted({by_name[n.lower()] for n in m.source_projects
-                               if n.lower() in by_name})
-            spec = m.model_dump(exclude={"new_standards"})
+            projects = sorted({s["id"] for s in sources})
+            spec = {**m.model_dump(exclude={"new_standards"}), **terms}
             cur.execute("SELECT maturity, projects, spec FROM modules WHERE code = %s", (m.code,))
             old = cur.fetchone()
             maturity = m.maturity
@@ -2053,12 +2066,21 @@ def _store_modular(cur, job, result) -> dict:
                  m.cost_low_income, Jsonb(sorted({i.standard for i in m.interfaces})),
                  Jsonb(projects), Jsonb(spec), job_id),
             )
-        return {"modules": len(result.modules)}
+            stored += 1
+        return {"modules": stored, **({"refused": refused} if refused else {})}
 
     if job_type == modular.SYSTEMS:
         scenario = inp["scenario"]
+        cur.execute("SELECT code, spec FROM modules WHERE (spec->>'non_commercial')::boolean")
+        nc_modules = {r["code"]: r["spec"].get("licence") for r in cur.fetchall()}
         for s in result.systems:
             code = s.code if s.code.startswith(scenario) else modular.slug(f"{scenario}-{s.code}")
+            # Everything built from a non-commercial module is non-commercial.
+            nc = sorted({m.module for m in s.modules if m.module in nc_modules})
+            spec = {**s.model_dump(), "non_commercial": bool(nc),
+                    **({"non_commercial_modules": nc,
+                        "licences": sorted({nc_modules[c] for c in nc if nc_modules[c]})}
+                       if nc else {})}
             cur.execute(
                 """
                 INSERT INTO systems (code, name, scenario, cost_eu, cost_low_income,
@@ -2070,7 +2092,7 @@ def _store_modular(cur, job, result) -> dict:
                     spec = EXCLUDED.spec, job_id = EXCLUDED.job_id, updated_at = NOW()
                 """,
                 (code, s.name, scenario, s.cost_eu, s.cost_low_income,
-                 Jsonb([m.model_dump() for m in s.modules]), Jsonb(s.model_dump()), job_id),
+                 Jsonb([m.model_dump() for m in s.modules]), Jsonb(spec), job_id),
             )
         return {"systems": len(result.systems)}
 
@@ -2526,6 +2548,12 @@ def set_site(item: SiteIn):
 #: Written into an archive note once the archiver has considered the
 #: project's own licence for a source without one (see archives_pending).
 PROJECT_LICENCE_WEIGHED = "project licence weighed"
+#: Written into the note of a licence skip once non-commercial licences are
+#: archived too (2026-10-23): an older licence skip is offered once more.
+NON_COMMERCIAL_WEIGHED = "non-commercial weighed"
+#: Project licence classes that may cover the project's own files as
+#: archived copies (a non-commercial copy is labelled so).
+ARCHIVABLE_CLASSES = ("open", "share-alike", "non-commercial")
 
 
 @app.get("/archives/pending")
@@ -2538,7 +2566,9 @@ def archives_pending(limit: int = 20):
     URLs): a file the project hosts itself, given no licence of its own,
     is covered by the project's. A source skipped for want of a licence is
     offered once more when its project's licence is open, until the
-    archiver has weighed that licence (its note says so)."""
+    archiver has weighed that licence (its note says so). A source skipped
+    for its licence before non-commercial copies were kept is offered once
+    more too."""
     with db() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -2561,11 +2591,19 @@ def archives_pending(limit: int = 20):
                 "FROM design_archives "
                 "WHERE status <> 'failed' OR created_at > NOW() - INTERVAL '1 day'")
             rows = cur.fetchall()
-    open_projects = {p["project_id"] for p in packs if p["licence_class"] in ("open", "share-alike")}
-    done = {(r["project_id"], r["source_uri"], r["revision"]) for r in rows
-            if not (r["status"] == "skipped" and r["project_id"] in open_projects
-                    and (r["licence"] or "unknown").lower() in ("unknown", "none", "")
-                    and PROJECT_LICENCE_WEIGHED not in (r["note"] or ""))}
+    open_projects = {p["project_id"] for p in packs if p["licence_class"] in ARCHIVABLE_CLASSES}
+
+    def reoffer(r) -> bool:
+        if r["status"] != "skipped":
+            return False
+        note = r["note"] or ""
+        if "no open licence" in note and NON_COMMERCIAL_WEIGHED not in note:
+            return True
+        return (r["project_id"] in open_projects
+                and (r["licence"] or "unknown").lower() in ("unknown", "none", "")
+                and PROJECT_LICENCE_WEIGHED not in note)
+
+    done = {(r["project_id"], r["source_uri"], r["revision"]) for r in rows if not reoffer(r)}
     pending = []
     for pack in packs:
         content = pack["content"] or {}

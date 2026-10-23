@@ -806,10 +806,11 @@ def test_unlicensed_design_files_get_one_more_try_under_the_project_licence(clie
                          "licence": "unknown"}]}
     sql("INSERT INTO build_packs (project_id, section, content) VALUES (%s, 'design', %s)",
         pid, Jsonb(design))
+    skipped = "no open or non-commercial licence reported; kept as a link"
     client.post("/archives", json={
         "project_id": pid, "source_uri": "https://example.org/drawing.pdf", "kind": "file",
         "licence": "unknown", "status": "skipped",
-        "note": "no open licence reported; kept as a link"})
+        "note": skipped + " (non-commercial weighed)"})
     assert client.get("/archives/pending").json() == []  # no open project licence: settled
 
     sql("INSERT INTO source_checks (project_id, licence, licence_class, repository) "
@@ -821,8 +822,41 @@ def test_unlicensed_design_files_get_one_more_try_under_the_project_licence(clie
     client.post("/archives", json={
         "project_id": pid, "source_uri": "https://example.org/drawing.pdf", "kind": "file",
         "licence": "unknown", "status": "skipped",
-        "note": "no open licence reported; kept as a link (project licence weighed)"})
+        "note": skipped + " (project licence weighed) (non-commercial weighed)"})
     assert client.get("/archives/pending").json() == []  # weighed once: settled
+
+
+def test_licence_skips_from_before_non_commercial_copies_get_one_more_try(client):
+    from psycopg.types.json import Jsonb
+
+    pid = project(client)
+    design = {"files": [{"name": "Drawing", "uri": "https://example.org/drawing.pdf",
+                         "licence": "CC BY-NC-SA 4.0"}]}
+    sql("INSERT INTO build_packs (project_id, section, content) VALUES (%s, 'design', %s)",
+        pid, Jsonb(design))
+    record = {"project_id": pid, "source_uri": "https://example.org/drawing.pdf",
+              "kind": "file", "licence": "CC BY-NC-SA 4.0", "status": "skipped",
+              "note": "no open licence reported; kept as a link"}
+    client.post("/archives", json=record)
+    [item] = client.get("/archives/pending").json()
+    assert item["licence"] == "CC BY-NC-SA 4.0"
+    client.post("/archives", json={**record, "note": "no open or non-commercial licence "
+                                   "reported; kept as a link (non-commercial weighed)"})
+    assert client.get("/archives/pending").json() == []
+    # A non-commercial project licence covers the project's own files too.
+    sql("INSERT INTO source_checks (project_id, licence, licence_class, repository) "
+        "VALUES (%s, 'CC-BY-NC-4.0', 'non-commercial', 'https://github.com/example/filter')",
+        pid)
+    sql("UPDATE design_archives SET licence = 'unknown'")
+    [item] = client.get("/archives/pending").json()
+    assert item["project_licence"] == "CC-BY-NC-4.0"
+
+
+def test_a_non_commercial_source_check_is_accepted(client):
+    pid = project(client)
+    r = client.post(f"/projects/{pid}/check", json={
+        "licence": "CC BY-NC-SA 4.0", "licence_class": "non-commercial"})
+    assert r.status_code == 200, r.text
 
 
 def test_build_instructions_cover_software_projects():
@@ -1125,6 +1159,68 @@ def test_modules_are_upserted_and_keep_trial_maturity(client):
     assert r.status_code == 200, r.text
     [module] = client.get("/modules").json()
     assert module["maturity"] == "tested" and len(module["projects"]) == 2
+
+
+def test_modules_on_non_commercial_designs_keep_the_licence_and_say_so(client):
+    screened(10)
+    discover(client)
+    run_job(client, "standards-synthesis", {"summary": "s", "standards": [STANDARD]})
+    approve_first_standard(client)
+    discover(client)
+    for name, licence, cls in (("P Water 0", "CC-BY-NC-SA-4.0", "non-commercial"),
+                               ("P Water 1", "GPL-3.0", "share-alike"),
+                               ("P Water 2", "MIT", "open")):
+        sql("INSERT INTO source_checks (project_id, licence, licence_class) "
+            "SELECT id, %s, %s FROM projects WHERE name = %s", licence, cls, name)
+    [base] = module_out()["modules"]
+    note = "No open design of a ram pump this size is documented."
+    out = {"summary": "s", "modules": [
+        {**base, "code": "nc-pump", "source_projects": ["P Water 0"], "licence_note": note},
+        {**base, "code": "nc-unexplained", "source_projects": ["P Water 0"]},
+        {**base, "code": "nc-with-gpl", "source_projects": ["P Water 0", "P Water 1"],
+         "licence_note": note},
+        {**base, "code": "open-pump", "source_projects": ["P Water 2"], "licence": None}]}
+    _, r = run_job(client, "module-synthesis", out)
+    assert r.status_code == 200, r.text
+    modules = {m["code"]: m for m in client.get("/modules").json()}
+    assert set(modules) == {"nc-pump", "open-pump"}
+    nc = modules["nc-pump"]["spec"]
+    assert (nc["licence"], nc["non_commercial"], nc["non_commercial_sources"]) == (
+        "CC-BY-NC-SA-4.0", True, ["P Water 0"])
+    assert (modules["open-pump"]["spec"]["licence"],
+            modules["open-pump"]["spec"]["non_commercial"]) == ("CERN-OHL-S-2.0", False)
+    assert r.json()["modules"] == 2
+    assert {x["code"] for x in r.json()["refused"]} == {"nc-unexplained", "nc-with-gpl"}
+
+    # Built from a non-commercial module, a system is non-commercial too.
+    job_id = client.post("/jobs", json={
+        "project_id": project(client, code="JOB-HOLDER"), "job_type": "system-design",
+        "input": {"scenario": "household"}}).json()["id"]
+    claim(client, APOLLO, ["system-design"])
+    system = system_out()
+    system["systems"][0]["modules"] = [{"module": "nc-pump"}, {"module": "open-pump"}]
+    r = client.post(f"/jobs/{job_id}/complete", json={"worker": APOLLO, "output": system})
+    assert r.status_code == 200, r.text
+    [stored] = client.get("/systems").json()
+    assert stored["spec"]["non_commercial"] is True
+    assert stored["spec"]["non_commercial_modules"] == ["nc-pump"]
+    assert stored["spec"]["licences"] == ["CC-BY-NC-SA-4.0"]
+
+
+def test_module_terms():
+    import modular
+
+    nc = {"name": "A", "licence": "CC BY-NC 4.0", "licence_class": "non-commercial"}
+    ncsa = {"name": "B", "licence": "CC-BY-NC-SA-4.0", "licence_class": "non-commercial"}
+    sa = {"name": "C", "licence": "CC-BY-SA-4.0", "licence_class": "share-alike"}
+    assert modular.module_terms("", "", []) == {"licence": "CERN-OHL-S-2.0",
+                                                "non_commercial": False}
+    assert modular.module_terms("CC-BY-SA-4.0", "", [sa])["licence"] == "CC-BY-SA-4.0"
+    assert modular.module_terms("", "why", [nc, ncsa])["licence"] == "CC-BY-NC-SA-4.0"
+    assert "share-alike C" in modular.module_terms("", "why", [nc, sa])["refused"]
+    assert "licence_note" in modular.module_terms("CC BY-NC 4.0", " ", [nc])["refused"]
+    # A model naming a non-commercial licence itself is labelled so.
+    assert modular.module_terms("CC BY-NC 4.0", "", [])["non_commercial"] is True
 
 
 def test_systems_follow_the_module_wave_then_the_roadmap(client):

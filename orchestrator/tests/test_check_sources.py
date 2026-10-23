@@ -20,7 +20,9 @@ import check_sources as cs  # noqa: E402
     ("CC-BY-SA-4.0", "share-alike"), ("CC BY-SA 4.0", "share-alike"),
     ("CERN-OHL-S-2.0", "share-alike"), ("CERN OHL v1.2", "share-alike"),
     ("TAPR Open Hardware License", "share-alike"), ("MPL-2.0", "share-alike"),
-    ("CC-BY-NC-SA-4.0", "restricted"), ("CC BY-NC 4.0", "restricted"),
+    ("CC-BY-NC-SA-4.0", "non-commercial"), ("CC BY-NC 4.0", "non-commercial"),
+    ("TAPR Noncommercial Hardware License", "non-commercial"),
+    ("Non-commercial use only", "restricted"), ("CC-BY-NC-ND-4.0", "restricted"),
     ("CC-BY-ND-4.0", "restricted"), ("PolyForm Noncommercial 1.0.0", "restricted"),
     ("NOASSERTION", "unknown"), ("Other", "unknown"), ("", "unknown"), (None, "unknown"),
 ])
@@ -116,7 +118,7 @@ def test_no_repository_uses_the_reported_licence_or_unknown():
     assert cs.check_project({"urls": ["https://x.org"]}, get, allow)["licence_class"] == "unknown"
     result = cs.check_project({"urls": ["https://x.org"],
                                "reported": [{"licence": "CC BY-NC-SA 4.0"}]}, get, allow)
-    assert result["licence_class"] == "restricted"
+    assert result["licence_class"] == "non-commercial"
 
 
 def test_a_rate_limit_stops_the_batch_without_recording():

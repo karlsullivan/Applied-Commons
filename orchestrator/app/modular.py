@@ -77,6 +77,42 @@ MIN_ASSESSED_FOR_STANDARDS = 10
 MIN_ASSESSED_PER_DOMAIN = 2
 MIN_MODULES_FOR_SYSTEMS = 5
 
+#: Applied Commons' own licence for modules (Licence-Hardware.md).
+MODULE_LICENCE = "CERN-OHL-S-2.0"
+#: Non-commercial designs (maintainer decision 2026-10-23, policy section
+#: 9): open first, non-commercial ones as references, and built on only
+#: sparingly, when no open design serves. A module built on one keeps that
+#: licence and is labelled non-commercial, as is everything built from it.
+#: It cannot also draw on a share-alike design: GPL, CERN-OHL-S, BY-SA and
+#: the like forbid the added non-commercial restriction.
+NON_COMMERCIAL = "non-commercial"
+_NC_NAME = re.compile(r"\bNC\b|non-?commercial", re.I)
+_SHARE_ALIKE_NC = re.compile(r"\bSA\b|share-?alike", re.I)
+
+
+def module_terms(licence: str, licence_note: str, sources: list[dict]) -> dict[str, Any]:
+    """A module's licence, from its sources' checked licences (each
+    {name, licence, licence_class}): {licence, non_commercial,
+    non_commercial_sources} or {refused: reason}."""
+    nc = [s for s in sources if s.get("licence_class") == NON_COMMERCIAL]
+    if not nc:
+        return {"licence": licence or MODULE_LICENCE,
+                "non_commercial": bool(_NC_NAME.search(licence or ""))}
+    names = ", ".join(s["name"] for s in nc)
+    reciprocal = [s["name"] for s in sources if s.get("licence_class") == "share-alike"]
+    if reciprocal:
+        return {"refused": f"built on non-commercial {names} and share-alike "
+                           f"{', '.join(reciprocal)}, whose licences cannot be combined"}
+    if not licence_note.strip():
+        return {"refused": f"built on non-commercial {names} without saying why no open "
+                           "design serves (licence_note)"}
+    # The derivative keeps the source's licence; BY-NC-SA binds what it is
+    # combined with, so it wins over BY-NC.
+    chosen = sorted((s.get("licence") or "CC-BY-NC" for s in nc),
+                    key=lambda name: not _SHARE_ALIKE_NC.search(name))[0]
+    return {"licence": chosen, "non_commercial": True,
+            "non_commercial_sources": [s["name"] for s in nc]}
+
 
 def spec_hash(spec: str) -> str:
     """Identifies the version of a standard's spec that was verified."""
@@ -288,6 +324,13 @@ class ModuleIn(_Coded):
     source_projects: list[str] = Field(default_factory=list, max_length=30)
     new_standards: list[StandardIn] = Field(default_factory=list, max_length=5)
     notes: str = Field(default="", max_length=3000)
+    licence: str = Field(default="", max_length=200)
+    licence_note: str = Field(default="", max_length=1000)
+
+    @field_validator("licence", "licence_note", mode="before")
+    @classmethod
+    def _optional_text(cls, value):
+        return "" if value is None else str(value)
 
     @field_validator("kind")
     @classmethod
@@ -587,17 +630,23 @@ def module_input(category: dict, brief: dict | None, projects: list[dict],
             "reusable modules: self-contained building blocks (hardware, "
             "software or both) that several of the projects below, or several "
             "systems in the scenarios, could share. Base them on the projects' "
-            "documented designs, and only on designs whose licences allow "
-            "modification and commercial use (such as CERN-OHL, CC BY or BY-SA, "
-            "GPL, MIT, Apache). Applied Commons releases modules under "
+            "documented designs, on designs whose licences allow modification "
+            "and commercial use (such as CERN-OHL, CC BY or BY-SA, GPL, MIT, "
+            "Apache) wherever possible. Applied Commons releases modules under "
             "CERN-OHL-S-2.0 (one derived from a share-alike design keeps that "
-            "design's licence, which you must name in notes), so never build on "
-            "a non-commercial or unlicensed "
-            "design; name it in notes instead. Each project's licence_class "
-            "comes from a source check of its repository: build only on open or "
-            "share-alike ones; restricted or none means do not build on it; "
-            "unknown or unchecked means confirm the licence from its repository "
-            "first and give it in notes. Connect modules only through "
+            "design's licence: give it in licence). Each project's licence_class "
+            "comes from a source check of its repository: build on open or "
+            "share-alike ones; restricted or none means do not build on it, and "
+            "name it in notes instead; unknown or unchecked means confirm the "
+            "licence from its repository first and give it in notes. "
+            "non-commercial (such as CC BY-NC or BY-NC-SA) means use it as a "
+            "reference, named in notes, wherever possible; build on it only "
+            "sparingly, when no open or share-alike project serves, and then "
+            "give its licence in licence (the module keeps it and is labelled "
+            "non-commercial) and say in licence_note why no open design "
+            "serves. A module built on a non-commercial design must not also "
+            "draw on a share-alike one (their licences cannot be combined); "
+            "such a module is refused. Connect modules only through "
             "approved_standards "
             "(reference each by its code in interfaces). pending_standards are "
             "proposed and waiting for the maintainer: when one covers an "
@@ -623,8 +672,8 @@ def module_input(category: dict, brief: dict | None, projects: list[dict],
             '"unit_cost_low_income": null, "notes": ""}], "cost_eu": null, '
             '"cost_low_income": null, "maturity": "concept|documented", '
             '"source_projects": [""], "new_standards": [' + _STANDARD_FORMAT
-            + '], "notes": ""}], "evidence": [{"source_uri": "<url>", "title": '
-            '"", "source_type": ""}]}'
+            + '], "licence": "", "licence_note": "", "notes": ""}], '
+            '"evidence": [{"source_uri": "<url>", "title": "", "source_type": ""}]}'
         ),
     }
 
@@ -645,7 +694,10 @@ def system_input(scenario: str, briefs: list[dict], modules: list[dict],
             "thermal loads, storage and structural capacity. Run them in Python "
             "and give the code, its inputs and its results; label each "
             "calculated or simulated. Check that the modules' interfaces "
-            "connect (interface_check). " + _COSTS + " List failure_modes and "
+            "connect (interface_check). A module marked non_commercial is "
+            "under a non-commercial licence: use it only when no open module "
+            "serves, since the system is then non-commercial too (it is "
+            "labelled so). " + _COSTS + " List failure_modes and "
             "missing_modules (modules the system needs that do not exist yet). "
             + research._COMMON
         ),

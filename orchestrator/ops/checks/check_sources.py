@@ -12,10 +12,11 @@ days) and records each result with ``POST /projects/{id}/check``:
   errors, timeouts) or skipped (not a public web address);
 - licence: from the GitHub or GitLab API for the project's first
   repository (verified), else from the build pack or design archive
-  (reported by a model). Classed open, share-alike, restricted
-  (non-commercial or no-derivatives), none (a repository without a
-  licence: all rights reserved) or unknown. Modules build only on open
-  and share-alike projects (policy section 9);
+  (reported by a model). Classed open, share-alike, non-commercial,
+  restricted (no-derivatives, source-available, or non-commercial terms
+  of no known licence), none (a repository without a licence: all rights
+  reserved) or unknown. Modules build on open and share-alike projects,
+  and on non-commercial ones only sparingly (policy section 9);
 - activity: the repository's last push and whether it is archived.
 
 Only http(s) URLs on public addresses are fetched, including after
@@ -45,9 +46,14 @@ TIMEOUT = 20
 USER_AGENT = "applied-commons-source-check (+https://github.com/karlsullivan/Applied-Commons)"
 MAX_LINKS = 20
 
-#: Non-commercial, no-derivatives and source-available terms: not open.
-RESTRICTED = re.compile(r"\b(NC|ND)\b|non-?commercial|no-?deriv|polyform|commons clause|"
+#: No-derivatives and source-available terms: not open, and not built on.
+RESTRICTED = re.compile(r"\bND\b|no-?deriv|polyform|commons clause|"
                         r"\bSSPL\b|\bBUSL\b|business source|elastic licen", re.I)
+#: Non-commercial terms. In a licence whose other terms are known (Creative
+#: Commons, TAPR NCL) they allow changes but not commercial use: built on
+#: only sparingly, and labelled non-commercial (policy section 9).
+NON_COMMERCIAL = re.compile(r"\bNC\b|non-?commercial", re.I)
+NC_KNOWN = re.compile(r"\bCC\b|creative commons|attribution|\bTAPR\b", re.I)
 #: Reciprocal licences: derivatives stay under the same licence.
 SHARE_ALIKE = re.compile(r"\b(A?GPL|LGPL|GNU)\b|BY-SA|share-?alike|CERN[- ]?OHL(?![- ]?(v?2(\.0)?[- ]?)?P\b)|"
                          r"reciprocal|\bMPL\b|mozilla|\bEUPL\b|TAPR|\bOSL\b|\bEPL\b|\bCDDL\b", re.I)
@@ -58,11 +64,14 @@ OPEN = re.compile(r"\b(MIT|Apache|BSD|0BSD|ISC|Unlicense|CC0|zlib|BSL-1\.0|Solde
 
 
 def classify(name: str | None) -> str:
-    """open, share-alike, restricted or unknown, from a licence name or SPDX id."""
+    """open, share-alike, non-commercial, restricted or unknown, from a
+    licence name or SPDX id."""
     if not name or name.strip().upper() in ("NOASSERTION", "OTHER", "UNKNOWN", "NONE"):
         return "unknown"
     if RESTRICTED.search(name):
         return "restricted"
+    if NON_COMMERCIAL.search(name):
+        return "non-commercial" if NC_KNOWN.search(name) else "restricted"
     if SHARE_ALIKE.search(name):
         return "share-alike"
     if OPEN.search(name):

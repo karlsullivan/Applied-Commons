@@ -15,7 +15,10 @@ and the outcome is recorded with ``POST /archives``:
   the licence is the one the build pack reported.
 
 Sources without a recognisable open licence are recorded as 'skipped' and
-stay links only. Only https sources on public addresses are fetched (no
+stay links only. A non-commercial (NC) licence is archived too, as a
+preservation copy marked non-commercial wherever it is shown (maintainer
+decision 2026-10-23, policy section 4c); no-derivatives and unknown
+licences are not. Only https sources on public addresses are fetched (no
 loopback, private or link-local hosts, including after redirects), so a
 link in model output cannot reach services on this host. Standard library
 plus git; runs as the orchestrator user (ops/systemd/applied-commons-archive.*).
@@ -78,20 +81,54 @@ RESTRICTED = re.compile(
     r"\bunknown\b|\bnone\b", re.I)
 
 
+#: Non-commercial terms, and what still rules out a copy alongside them.
+NON_COMMERCIAL = re.compile(r"\bNC\b|non[- ]?commercial", re.I)
+NOT_COPYABLE = re.compile(
+    r"\bND\b|no[- ]?deriv|proprietary|all rights reserved|\bunknown\b|\bnone\b", re.I)
+#: Matches NON_COMMERCIAL_WEIGHED in the API: a source skipped for its
+#: licence before NC copies were kept is offered once more, until noted.
+NON_COMMERCIAL_WEIGHED = "non-commercial weighed"
+
+
+def _words(name: str) -> str:
+    return name.replace("-", " ").replace("_", " ")
+
+
 def open_licence(name: str | None) -> bool:
-    if not name or RESTRICTED.search(name.replace("-", " ").replace("_", " ")):
+    """Copying, changes and commercial use allowed: what AC builds on."""
+    if not name or RESTRICTED.search(_words(name)):
         return False
     if re.fullmatch(r"(CC|Creative Commons)( licen[cs]e)?", name.strip(), re.I):
         return False  # which Creative Commons licence is not said
     return bool(OPEN_NAME.search(name))
 
 
+def non_commercial(name: str | None) -> bool:
+    """A named licence that allows copying and changes but not commercial
+    use, such as CC BY-NC or BY-NC-SA."""
+    if not name or not NON_COMMERCIAL.search(_words(name)) or NOT_COPYABLE.search(_words(name)):
+        return False
+    return bool(OPEN_NAME.search(name))
+
+
+def archivable(name: str | None) -> bool:
+    """May be kept as a copy: an open licence, or a non-commercial one."""
+    return open_licence(name) or non_commercial(name)
+
+
+def _licence_skip(note: str) -> str:
+    return f"{note} ({NON_COMMERCIAL_WEIGHED})"
+
+
 def licence_from_text(text: str) -> str | None:
     for name, pattern in OPEN_TEXT:
         if pattern.search(text):
-            if name == "CC":  # only the open Creative Commons licences
-                if re.search(r"NonCommercial|NoDerivatives|NoDerivs|\bBY[- ]N[CD]\b", text, re.I):
+            if name == "CC":  # which Creative Commons licence, NC included
+                if re.search(r"NoDerivatives|NoDerivs|\bBY[- ](NC[- ])?ND\b", text, re.I):
                     return None
+                if re.search(r"NonCommercial|\bBY[- ]NC\b", text, re.I):
+                    return ("CC-BY-NC-SA" if re.search(r"ShareAlike|NC[- ]SA\b", text, re.I)
+                            else "CC-BY-NC")
                 return "CC-BY-SA" if re.search(r"ShareAlike|BY[- ]SA", text, re.I) else (
                     "CC0" if re.search(r"\bCC0\b|Public Domain Dedication", text, re.I) else
                     "CC-BY" if re.search(r"Attribution", text, re.I) else None)
@@ -156,7 +193,7 @@ def project_licence_for(item: dict) -> str | None:
     source (same site, or the same owner on a code host); a file merely
     linked from elsewhere is not covered by it."""
     licence = item.get("project_licence")
-    if not open_licence(licence):
+    if not archivable(licence):
         return None
     mine = {origin(o) for o in item.get("project_origins") or []}
     return licence if origin(item["source_uri"]) in mine else None
@@ -220,7 +257,7 @@ def archive_git(item: dict, dest: Path) -> dict:
                 if licence:
                     break
         reported = item.get("licence") or "unknown"
-        if licence is None and open_licence(reported):
+        if licence is None and archivable(reported):
             licence = reported
             note += "licence as reported by the build pack (no licence file recognised). "
         if licence is None and project_licence_for(item):
@@ -229,7 +266,8 @@ def archive_git(item: dict, dest: Path) -> dict:
         if licence is None:
             weighed = f" ({PROJECT_LICENCE_WEIGHED})" if item.get("project_licence") else ""
             return {"status": "skipped", "resolved_revision": commit, "licence": reported,
-                    "note": note + "no open licence found; kept as a link" + weighed}
+                    "note": _licence_skip(note + "no open or non-commercial licence found; "
+                                          "kept as a link" + weighed)}
         dest.mkdir(parents=True, exist_ok=True)
         repo_name = safe_name(url.rstrip("/").split("/")[-1].removesuffix(".git"))
         target = dest / f"{repo_name}-{commit[:12]}.tar.gz"
@@ -280,12 +318,13 @@ def archive_file(item: dict, dest: Path) -> dict:
     url = item["source_uri"]
     licence = item.get("licence") or "unknown"
     note = ""
-    if not open_licence(licence):
+    if not archivable(licence):
         inherited = project_licence_for(item)
         if inherited is None:
             weighed = f" ({PROJECT_LICENCE_WEIGHED})" if item.get("project_licence") else ""
             return {"status": "skipped", "licence": licence,
-                    "note": "no open licence reported; kept as a link" + weighed}
+                    "note": _licence_skip("no open or non-commercial licence reported; "
+                                          "kept as a link" + weighed)}
         licence = inherited
         note = "licence of the project, which hosts this file. "
     reason = public_https(url)
@@ -491,6 +530,9 @@ def run() -> int:
         record = {"project_id": item["project_id"], "source_uri": item["source_uri"],
                   "kind": item["kind"], "revision": item["revision"],
                   "licence": item.get("licence") or "unknown", **outcome}
+        if record["status"] == "archived" and non_commercial(record["licence"]):
+            record["note"] = ("non-commercial licence: a preservation copy, labelled "
+                              "non-commercial. " + (record.get("note") or "")).strip()
         _api("POST", "/archives", record)
         counts[record["status"]] = counts.get(record["status"], 0) + 1
         print(f"{record['status']}: {item['code']} {item['source_uri']} {record.get('note', '')}")
