@@ -7,6 +7,7 @@ Run from the repository root:
     TEST_DATABASE_URL=postgresql://... pytest orchestrator/tests
 """
 
+import json
 import os
 import pathlib
 import sys
@@ -43,7 +44,8 @@ def clean(client):
         conn.execute(
             "TRUNCATE jobs, findings, evidence, questions, projects, sites, modules, "
             "systems, standards, roadmaps, graph_updates, graph_sources, needs, "
-            "capabilities, graph_assessments, design_preservation RESTART IDENTITY CASCADE"
+            "capabilities, graph_assessments, design_preservation, library_imports, "
+            "library_records, library_tasks RESTART IDENTITY CASCADE"
         )
         conn.execute("UPDATE need_categories SET solved_at = NULL, solved_note = NULL")
     yield
@@ -2597,3 +2599,161 @@ def test_identity_keys():
     assert main.identity_keys("ODK (Open Data Kit)", ["https://github.com/getodk/Central.git"]) == {
         "name:odk", "repo:github.com/getodk/central"}
     assert main.identity_keys("ODK", []) == {"name:odk"}
+
+
+# ---- production library (section 4l) ----------------------------------------
+
+
+def lib_package(**changes):
+    sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+    from library_fixture import package
+    return package(**changes)
+
+
+def lib_counts():
+    return {t: sql(f"SELECT count(*) FROM {t}")[0][0] for t in (
+        "library_records", "library_edges", "library_tasks", "library_links",
+        "library_record_versions")}
+
+
+def test_a_library_import_twice_creates_nothing_new(client):
+    pid = project(client, code="PUMP-1")
+    sql("UPDATE projects SET source_uris = %s::jsonb WHERE id = %s",
+        json.dumps(["https://github.com/example/pump"]), pid)
+    canonical = (sql("SELECT count(*) FROM capabilities")[0][0],
+                 sql("SELECT count(*) FROM projects")[0][0])
+    r = client.post("/library/import", json=lib_package())
+    assert r.status_code == 200, r.text
+    first = r.json()
+    assert first["inserted"] == len(lib_package()["nodes"]) and first["bootstrap_cycles"] == 1
+    assert first["links_proposed"] >= 1 and first["edges"] == 2
+    before = lib_counts()
+    again = client.post("/library/import", json=lib_package()).json()
+    assert (again["inserted"], again["updated"], again["tasks_opened"],
+            again["links_proposed"]) == (0, 0, 0, 0)
+    assert again["unchanged"] == first["inserted"] and lib_counts() == before
+    # The canonical graph and catalogue are not written by an import.
+    assert (sql("SELECT count(*) FROM capabilities")[0][0],
+            sql("SELECT count(*) FROM projects")[0][0]) == canonical
+    # Seeds and editorial edges are never SUPPORTED; the BOM-prefixed key was read.
+    assert sql("SELECT DISTINCT state FROM library_edges") == [("INFERRED",)]
+    assert sql("SELECT from_id FROM library_edges WHERE kind = 'legacy-candidate-support'") == [
+        ("X220",)]
+
+
+def test_library_requirement_groups_survive_the_round_trip(client):
+    client.post("/library/import", json=lib_package())
+    export = client.get("/library/export").json()
+    routes = {r["id"]: r for r in export["records"]["process_routes"]}
+    from library_fixture import EGG_EQUIPMENT
+    assert routes["PROC02"]["payload"]["equipment_requirements"] == EGG_EQUIPMENT
+    ent = {r["id"]: r for r in export["records"]["enterprises"]}
+    assert "X220" not in json.dumps(ent["ENT01"]["payload"]["minimum_candidate_requirements"])
+    assert ent["ENT02"]["payload"]["minimum_candidate_requirements"]["all_of"][0] == {
+        "ref_id": "X220"}
+    assert export["module_assessments"]["MOD01"]["interoperability"]["state"] == "UNKNOWN"
+    assert export["bootstrap_cycles"] == [["MAT46", "MAT51", "MAT48", "MAT46"]]
+
+
+def test_a_changed_seed_updates_a_staged_record_but_not_a_reviewed_one(client):
+    from library_fixture import find, rehash
+    client.post("/library/import", json=lib_package())
+
+    def change(p):
+        for coll, rid in (("items", "X203"), ("items", "X204")):
+            n = find(p, coll, rid)
+            n["payload"]["notes"] = "changed upstream"
+            rehash(n)
+    key = "ac-tool-library:items:X204"
+    r = client.post(f"/library/records/{key}/review", json={
+        "status": "reviewed", "note": "Checked against the maker page.", "decided_by": "karl"})
+    assert r.status_code == 200, r.text
+    report = client.post("/library/import", json=lib_package(c=change)).json()
+    assert (report["updated"], report["protected"]) == (1, 1)
+    rows = dict(sql("SELECT record_id, payload->>'notes' FROM library_records "
+                    "WHERE record_id IN ('X203', 'X204')"))
+    assert rows == {"X203": "changed upstream", "X204": None}
+    assert sql("SELECT count(*) FROM library_record_versions")[0][0] == 1
+    keys = {k for (k,) in sql("SELECT key FROM library_tasks WHERE kind IN "
+                              "('conflict', 'change-review')")}
+    assert {k.rsplit(":", 1)[0] for k in keys} == {
+        "conflict:ac-tool-library:items:X204", "change-review:ac-tool-library:items:X203"}
+    # The human review survives; the same change again opens nothing new.
+    assert sql("SELECT status, decided_by FROM library_reviews") == [("reviewed", "karl")]
+    assert client.post("/library/import", json=lib_package(c=change)).json()["tasks_opened"] == 0
+
+
+def test_a_renamed_or_missing_library_record_is_kept(client):
+    from library_fixture import find, rehash
+    client.post("/library/import", json=lib_package())
+
+    def rename_and_drop(p):
+        n = find(p, "items", "X204")
+        n["payload"]["name"] = "Egg collection conveyor"
+        rehash(n)
+        p["nodes"] = [x for x in p["nodes"] if not x["external_key"].endswith(":items:X212")]
+        for e in p["nodes"]:
+            if e["entity_type"] in ("process_routes", "enterprises"):
+                text = json.dumps(e["payload"]).replace('{"ref_id": "X212"}, ', "").replace(
+                    ', {"ref_id": "X212"}', "")
+                e["payload"] = json.loads(text)
+                rehash(e)
+    report = client.post("/library/import", json=lib_package(r=rename_and_drop)).json()
+    assert (report["identity_conflicts"], report["missing"]) == (1, 1)
+    assert sql("SELECT name FROM library_records WHERE record_id = 'X204'") == [
+        ("Automatic egg collection",)]
+    assert sql("SELECT in_latest_import FROM library_records WHERE record_id = 'X212'") == [
+        (False,)]
+    kinds = {k for (k,) in sql("SELECT kind FROM library_tasks "
+                               "WHERE kind IN ('conflict', 'missing')")}
+    assert kinds == {"conflict", "missing"}
+
+
+def test_an_invalid_library_package_writes_nothing(client):
+    from library_fixture import find
+
+    def corrupt(p):
+        find(p, "items", "H001")["payload"]["name"] = "Something else"
+    r = client.post("/library/import", json=lib_package(c=corrupt))
+    assert r.status_code == 422 and "payload_sha256" in r.text
+    assert sql("SELECT count(*) FROM library_imports")[0][0] == 0
+
+
+def test_library_reviews_links_and_tasks(client):
+    pid = project(client, code="PUMP-1")
+    sql("UPDATE projects SET source_uris = %s::jsonb WHERE id = %s",
+        json.dumps(["https://github.com/example/pump"]), pid)
+    client.post("/library/import", json=lib_package())
+    key = "ac-tool-library:designs:DES09"
+    r = client.post(f"/library/records/{key}/review", json={
+        "status": "verified", "note": "Built it.", "decided_by": "karl"})
+    assert r.status_code == 422  # verified needs sourced evidence
+    r = client.post(f"/library/records/{key}/review", json={
+        "status": "verified", "note": "Built and tested.", "decided_by": "karl",
+        "evidence": [{"source": "https://example.org/build-log", "note": "two builds"}]})
+    assert r.status_code == 200, r.text
+    [(link_id, status)] = sql("SELECT id, status FROM library_links "
+                              "WHERE target_type = 'project'")
+    assert status == "candidate"
+    r = client.post(f"/library/links/{link_id}/decision",
+                    json={"status": "confirmed", "decided_by": "karl", "note": "same repo"})
+    assert r.json()["status"] == "confirmed"
+    [(task_id,)] = sql("SELECT id FROM library_tasks WHERE key = 'design-audit:DES09'")
+    client.post(f"/library/tasks/{task_id}", json={"status": "done", "decided_by": "karl",
+                                                   "note": "audited"})
+    client.post("/library/import", json=lib_package())
+    assert sql("SELECT status FROM library_links WHERE id = %s", link_id) == [("confirmed",)]
+    assert sql("SELECT status FROM library_tasks WHERE id = %s", task_id) == [("done",)]
+    assert sql("SELECT review_status FROM library_records WHERE external_key = %s", key) == [
+        ("verified",)]
+    export = client.get("/library/export").json()
+    [design] = [d for d in export["records"]["designs"] if d["id"] == "DES09"]
+    assert design["links"][0]["target_code"] == "PUMP-1" and design["reviews"][0]["evidence"]
+    open_tasks = client.get("/library/tasks").json()
+    assert "design-audit:DES09" not in {t["key"] for t in open_tasks}
+    assert client.get("/library/tasks?status=open&kind=licence").json()[0]["key"] == \
+        "licence:DES10"
+
+
+def test_library_export_before_any_import(client):
+    assert client.get("/library/export").json() == {"imported": False}

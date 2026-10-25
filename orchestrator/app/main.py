@@ -7,6 +7,7 @@ from typing import Any
 
 import audit
 import graph
+import library
 import modular
 import research
 
@@ -3220,6 +3221,117 @@ def graph_export(candidates: bool = False):
     with db() as conn:
         with conn.cursor() as cur:
             return graph.export(cur, candidates)
+
+
+# ---------------------------------------------------------------------------
+# Production library (section 4l; library.py): staged beside the canonical
+# records, never into them
+# ---------------------------------------------------------------------------
+
+
+class LibraryPackage(BaseModel):
+    origin: str = Field(min_length=2, max_length=60)
+    version: str = Field(default="", max_length=40)
+    package_sha256: str = Field(default="", max_length=64)
+    imported_by: str = Field(min_length=2, max_length=200)
+    nodes: list[dict[str, Any]] = Field(max_length=20000)
+    edges: list[dict[str, Any]] = Field(default_factory=list, max_length=50000)
+    baseline_ids: dict[str, str] = Field(default_factory=dict)
+
+
+class LibraryReview(BaseModel):
+    status: str = Field(pattern="^(staged|reviewed|verified|rejected)$")
+    note: str = Field(min_length=3, max_length=4000)
+    decided_by: str = Field(min_length=2, max_length=200)
+    evidence: list[dict[str, Any]] = Field(default_factory=list, max_length=50)
+
+
+class LibraryDecision(BaseModel):
+    status: str = Field(pattern="^(confirmed|rejected|candidate|open|done|dismissed)$")
+    note: str = Field(default="", max_length=4000)
+    decided_by: str = Field(min_length=2, max_length=200)
+
+
+@app.post("/library/import")
+def library_import(item: LibraryPackage):
+    """Stage a production library package (ops/library/import_library.py).
+    Idempotent; a package that fails validation writes nothing (422)."""
+    with db() as conn:
+        with conn.cursor() as cur:
+            try:
+                return library.run_import(cur, item.model_dump(), item.imported_by)
+            except library.PackageError as exc:
+                conn.rollback()
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@app.get("/library/export")
+def library_export():
+    """The staged library, its reviews, links, tasks and assessments."""
+    with db() as conn:
+        with conn.cursor() as cur:
+            return library.export(cur)
+
+
+@app.get("/library/tasks")
+def library_tasks(status: str = "open", kind: str | None = None):
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id, key, kind, subject, title, detail, priority, status, note "
+                        "FROM library_tasks WHERE status = %s AND (%s::text IS NULL OR kind = %s) "
+                        "ORDER BY priority, key", (status, kind, kind))
+            return cur.fetchall()
+
+
+@app.post("/library/records/{key:path}/review")
+def library_review(key: str, item: LibraryReview):
+    """A human review of a staged record: reviewed or verified protects it
+    from later seeds; verified needs sourced evidence."""
+    with db() as conn:
+        with conn.cursor() as cur:
+            try:
+                result = library.review(cur, key, item.status, item.note, item.decided_by,
+                                        item.evidence)
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+            if result is None:
+                raise HTTPException(status_code=404, detail="no such library record")
+            return result
+
+
+@app.post("/library/links/{link_id}/decision")
+def library_link_decision(link_id: int, item: LibraryDecision):
+    """Confirm or reject a proposed link to a canonical AC record."""
+    if item.status not in ("confirmed", "rejected", "candidate"):
+        raise HTTPException(status_code=422, detail="confirmed, rejected or candidate")
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE library_links SET status = %s, note = %s, decided_by = %s, "
+                        "decided_at = NOW() WHERE id = %s RETURNING id, status",
+                        (item.status, item.note, item.decided_by, link_id))
+            row = cur.fetchone()
+            if row is None:
+                raise HTTPException(status_code=404, detail="no such link")
+            return row
+
+
+@app.post("/library/tasks/{task_id}")
+def library_task_status(task_id: int, item: LibraryDecision):
+    """Close, dismiss or reopen a research task; a closed task is not
+    reopened by a later import."""
+    if item.status not in ("open", "done", "dismissed"):
+        raise HTTPException(status_code=422, detail="open, done or dismissed")
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE library_tasks SET status = %s, note = %s, resolved_at = "
+                        "CASE WHEN %s = 'open' THEN NULL ELSE NOW() END WHERE id = %s "
+                        "RETURNING id, status",
+                        (item.status, f"{item.decided_by}: {item.note}".strip(), item.status,
+                         task_id))
+            row = cur.fetchone()
+            if row is None:
+                raise HTTPException(status_code=404, detail="no such task")
+            return row
 
 
 @app.post("/graph/{kind}/{item_id}/decision")
