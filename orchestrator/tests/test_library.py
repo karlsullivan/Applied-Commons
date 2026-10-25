@@ -106,3 +106,21 @@ def test_candidate_links_need_more_than_a_shared_host():
     assert {(l["record"], l["target_type"], l["target_id"]) for l in links} == {
         ("designs:DES09", "project", 1), ("capabilities:CAP15", "capability", 7),
         ("capabilities:CAP15", "category", 2)}
+
+
+def test_a_shared_site_name_alone_is_not_a_match():
+    by_type = {"sources": {"S1": {"url": "https://farmhack.org/tools/pedal-rootwasher"},
+                           "S2": {"url": "https://www.preciousplastic.com/machines/basic"}},
+               "designs": {"D1": {"name": "Farm Hack pedal rootwasher", "source_ids": ["S1"]},
+                           "D2": {"name": "Precious Plastic basic shredder", "source_ids": ["S2"]}}}
+    projects = [
+        {"id": 1, "name": "Farm Hack mobile chicken coop",
+         "source_uris": ["https://farmhack.org/tools/mobile-chicken-coop"]},
+        {"id": 2, "name": "Precious Plastic", "source_uris": ["https://preciousplastic.com/"]},
+        {"id": 3, "name": "Farm Hack pedal rootwasher v2",
+         "source_uris": ["https://farmhack.org/tools/other"]}]
+    links = {(l["record"], l["target_id"]): l["basis"]
+             for l in lib.candidate_links(by_type, projects, [], [], [])}
+    assert ("designs:D1", 1) not in links  # only "farm hack" in common
+    assert links[("designs:D1", 3)] == "same site and a shared name word"
+    assert links[("designs:D2", 2)].endswith("covers the whole family")

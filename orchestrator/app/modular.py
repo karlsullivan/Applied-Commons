@@ -605,9 +605,22 @@ def module_input(category: dict, brief: dict | None, projects: list[dict],
                  standards: list[dict], modules: list[dict],
                  superseded: dict[str, str] | None = None,
                  pending: list[dict] | None = None,
-                 rejected: list[dict] | None = None) -> dict[str, Any]:
+                 rejected: list[dict] | None = None,
+                 library: dict | None = None) -> dict[str, Any]:
     return {
         "domain": category["name"],
+        # The production library's shared-module proposals and outside
+        # dependencies for this domain (section 4l): to reconcile, not copy.
+        **({"library_proposals": library,
+            "library_note": "library_proposals come from the production library, an "
+                            "outside planning package: its shared modules have no "
+                            "specified interface and no shown interchangeability. Where "
+                            "one matches a module you define, reuse its name in notes and "
+                            "specify the interface properly; never treat its parameters "
+                            "as specified. Its external_dependencies are parts a "
+                            "community workshop keeps buying in: design modules to use "
+                            "standard, interchangeable ones."}
+           if library else {}),
         **({"track": category["track"]} if category.get("track") else {}),
         **({"need_brief": brief} if brief else {}),
         "projects": projects,

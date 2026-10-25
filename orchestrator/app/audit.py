@@ -100,14 +100,27 @@ class AuditResult(BaseModel):
 
 
 def audit_input(categories: list[dict], projects: list[dict], standards: list[dict],
-                modules: list[dict], gaps: list[dict]) -> dict[str, Any]:
+                modules: list[dict], gaps: list[dict],
+                library: dict | None = None) -> dict[str, Any]:
+    library_note = (
+        " production_library summarises the production library (section 4l): the local "
+        "service systems of a small community farm and workshop with their equipment by "
+        "community scope, the coverage of its proposed capabilities, and its external "
+        "dependencies. It is an outside planning package of proposals, not evidence: a "
+        "local system without core equipment, or a proposed capability with no located "
+        "design and no catalogue project, can be a gap (reference: the production "
+        "library), but say what in the catalogue is missing, not what the package claims."
+    ) if library else ""
     return {
         "categories": categories,
         "projects": projects,
         "standards": standards,
         "modules": modules,
         "previous_gaps": gaps,
-        "references": list(REFERENCES),
+        **({"production_library": library} if library else {}),
+        "references": list(REFERENCES) + (
+            ["the Applied Commons production library (an outside package of proposals)"]
+            if library else []),
         "instructions": (
             "Applied Commons is building a public-good catalogue of open, locally "
             "buildable solutions for every human need and the enablers those needs "
@@ -133,8 +146,8 @@ def audit_input(categories: list[dict], projects: list[dict], standards: list[di
             "acted (approved) gaps the catalogue now covers; do not raise again a gap "
             "the maintainer ignored (rejected) unless something has changed, and do "
             "not repeat a gap that is still open. Work from the material below and "
-            "from the reference lists you can retrieve; cite sources in evidence. "
-            + research._COMMON
+            "from the reference lists you can retrieve; cite sources in evidence."
+            + library_note + " " + research._COMMON
         ),
         "output_format": (
             '{"summary": "<one paragraph: how complete the catalogue is and its biggest '

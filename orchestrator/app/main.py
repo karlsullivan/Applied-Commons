@@ -1160,6 +1160,11 @@ def discover_backlog(item: BacklogDiscover):
     13. graph reviews: an independent graph-review of each safety-critical
        or medical capability graph candidate, again when it changes
        (section 4k).
+    14. library backlog: each design in the production library's
+       design-audit backlog enters the catalogue as a maintainer priority,
+       linked to its design (section 4l);
+    15. library research: library-research jobs on open library tasks,
+       at most library.MONTHLY_QUOTA a month (section 4l).
 
     Every job carries a stable unit key, so repeated runs never enqueue the
     same unit twice; completed or failed units are not re-enqueued. Topics
@@ -1183,6 +1188,8 @@ def discover_backlog(item: BacklogDiscover):
             safety = _review_safety(cur, item.limit)
             audited = _audit_catalogue(cur)
             graph_reviews = _review_graph(cur, item.limit)
+            library_backlog = _library_backlog(cur)
+            library_jobs = _research_library(cur, item.limit)
         conn.commit()
     return {
         "steered": steered,
@@ -1201,6 +1208,8 @@ def discover_backlog(item: BacklogDiscover):
         "safety": safety,
         "audit": audited,
         "graph_reviews": graph_reviews,
+        "library_backlog": library_backlog,
+        "library_research": library_jobs,
     }
 
 
@@ -1815,7 +1824,8 @@ def _modular_set(cur, budget: int, month: str | None = None) -> list:
             **modular.module_input(category, _latest_brief(cur, category["id"]),
                                    _projects_digest(cur, category["id"], 25, detail=True),
                                    standards, _modules_digest(cur), superseded,
-                                   pending, rejected)})
+                                   pending, rejected,
+                                   library.module_proposals(cur, category["name"]))})
 
     if _wave_pending(cur, modular.MODULES, month):
         return created
@@ -3004,7 +3014,8 @@ def _audit_catalogue(cur, month: str | None = None) -> list:
                 "WHERE status <> 'closed' ORDER BY id")
     gaps = cur.fetchall()
     job = _enqueue(cur, unit_key=key, job_type=audit.AUDIT, priority=audit.AUDIT_PRIORITY,
-                   payload=audit.audit_input(categories, projects, standards, modules, gaps))
+                   payload=audit.audit_input(categories, projects, standards, modules, gaps,
+                                             library.audit_summary(cur)))
     return [job] if job else []
 
 
@@ -3244,6 +3255,79 @@ class LibraryReview(BaseModel):
     note: str = Field(min_length=3, max_length=4000)
     decided_by: str = Field(min_length=2, max_length=200)
     evidence: list[dict[str, Any]] = Field(default_factory=list, max_length=50)
+
+
+class LibraryResearchIn(library.ResearchResult):
+    """Research recorded by hand, by a person or an assistant session."""
+    task_key: str = Field(min_length=3, max_length=500)
+    assessor: str = Field(min_length=3, max_length=200)
+
+
+def _library_backlog(cur) -> list:
+    """Design-audit backlog designs enter the catalogue as maintainer
+    priorities (maintainer decision 2026-10-25), linked to their design."""
+    cur.execute("SELECT id, name FROM need_categories")
+    categories = {r["name"]: r["id"] for r in cur.fetchall()}
+    cur.execute("SELECT name, layer FROM need_categories")
+    layers = {r["name"]: r["layer"] for r in cur.fetchall()}
+    added = []
+    for d in library.backlog_designs_without_project(cur):
+        name = next((c for c in d["categories"] if c in categories), None)
+        if name is None:
+            continue
+        cid = categories[name]
+        code = f"c{cid}-{research.slug(d['name'])}"
+        cur.execute(
+            """
+            INSERT INTO projects (code, name, maslow_level, domain, status, category_id, summary,
+                                  source_uris, priority, priority_note, prioritised_at)
+            VALUES (%s, %s, %s, %s, 'candidate', %s, %s, %s, TRUE, %s, NOW())
+            ON CONFLICT DO NOTHING RETURNING id
+            """,
+            (code, d["name"], layers.get(name), name, cid, d["summary"],
+             Jsonb(d["source_uris"]), f"maintainer priority 2026-10-25: {d['note']}"))
+        row = cur.fetchone()
+        basis, status = "created from the design-audit backlog", "confirmed"
+        if row is None:  # already catalogued under this name: a candidate link to review
+            cur.execute("SELECT id FROM projects WHERE code = %s OR (category_id = %s AND "
+                        "lower(name) = lower(%s))", (code, cid, d["name"]))
+            row = cur.fetchone()
+            basis, status = "same name as the backlog design", "candidate"
+        if row is None:
+            continue
+        cur.execute(
+            "INSERT INTO library_links (record_id, target_type, target_id, basis, status, "
+            "decided_by, decided_at) VALUES (%s, 'project', %s, %s, %s, %s, "
+            "CASE WHEN %s = 'confirmed' THEN NOW() END) ON CONFLICT DO NOTHING",
+            (d["record_id"], row["id"], basis, status,
+             "applied-commons (design-audit backlog)", status))
+        added.append({"design": d["design"], "project_id": row["id"], "link": status})
+    return added
+
+
+def _research_library(cur, budget: int) -> list:
+    """library-research jobs on open library tasks, within the month's quota."""
+    created = []
+    for task in library.research_due(cur, budget):
+        job = _enqueue(cur, unit_key=f"{library.RESEARCH}:{task['key']}",
+                       job_type=library.RESEARCH, priority=library.RESEARCH_PRIORITY,
+                       payload=library.research_input(cur, task))
+        if job:
+            created.append(job)
+    return created
+
+
+@app.post("/library/research")
+def library_research_record(item: LibraryResearchIn):
+    """Research on a library task recorded by hand: a person or an
+    assistant session, named in assessor. Like a research job's, it
+    verifies nothing and closes no task."""
+    with db() as conn:
+        with conn.cursor() as cur:
+            result = library.store_research(cur, item.task_key, item, item.assessor)
+            if result is None:
+                raise HTTPException(status_code=404, detail="no such library task")
+            return result
 
 
 class LibraryDecision(BaseModel):
@@ -3534,6 +3618,8 @@ def complete_job(job_id: int, item: JobComplete):
                    if job_type == audit.AUDIT else None)
         graph_review = (graph.GraphReviewResult(**item.output)
                         if job_type == graph.REVIEW else None)
+        library_research = (library.ResearchResult(**item.output)
+                            if job_type == library.RESEARCH else None)
         if assessment is not None:
             # Only an enabler lists the needs it serves (section 2a).
             assessment.serves = list(dict.fromkeys(
@@ -3638,6 +3724,11 @@ def complete_job(job_id: int, item: JobComplete):
                                          str(item.output.get("summary") or ""))
                 elif graph_review is not None:
                     extra = graph.store_review(cur, result, graph_review)
+                elif library_research is not None:
+                    task_key = ((result["input"] or {}).get("task") or {}).get("key", "")
+                    extra = {"library_research": library.store_research(
+                        cur, task_key, library_research,
+                        f"Applied Commons research worker (job {job_id})", job_id)}
                 elif job_type == research.LITERATURE and result["question_id"]:
                     cur.execute(
                         "UPDATE questions SET status = 'answered' "

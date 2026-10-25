@@ -26,10 +26,13 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from collections import defaultdict
+from collections import Counter, defaultdict
 from typing import Any, Iterable
 
 from psycopg.types.json import Jsonb
+from pydantic import BaseModel, Field, field_validator, model_validator
+
+import research as _research
 
 Json = dict[str, Any]
 
@@ -420,15 +423,24 @@ def candidate_links(by_type: dict[str, dict[str, Json]], projects: list[Json],
         keys = {_url_key(u) for u in urls if u}
         hosts = {_host(u) for u in urls if u} - CODE_HOSTS
         words = _words(d.get("name"))
+        brand = re.sub(r"[^a-z0-9]", "", "".join(sorted(hosts)))
         for p in projects:
             p_urls = [u for u in [p.get("repository"), *(p.get("source_uris") or [])] if u]
             p_keys = {_url_key(u) for u in p_urls}
+            shared = words & _words(p.get("name"))
+            p_words = _words(p.get("name"))
             if keys & p_keys:
                 basis = "same source URL"
-            elif (hosts & {_host(u) for u in p_urls}) and (words & _words(p.get("name"))):
-                basis = "same site and a shared name word"
-            else:
+            elif not hosts & {_host(u) for u in p_urls} or not shared:
                 continue
+            elif {w for w in shared if w not in brand}:
+                basis = "same site and a shared name word"
+            elif p_words and all(w in brand for w in p_words):
+                # The catalogue project is the site's whole family (Precious
+                # Plastic, WikiHouse): a family-level match.
+                basis = "same site; the catalogue project covers the whole family"
+            else:
+                continue  # only the site's own name in common (Farm Hack's tools)
             out.append({"record": f"designs:{design_id}", "target_type": "project",
                         "target_id": p["id"], "basis": basis})
     by_name = {c["name"]: c for c in categories}
@@ -586,12 +598,24 @@ def run_import(cur, package: Json, imported_by: str) -> Json:
     cur.execute("SELECT id, entity_type, record_id FROM library_records WHERE origin = %s",
                 (origin,))
     ids = {f"{r['entity_type']}:{r['record_id']}": r["id"] for r in cur.fetchall()}
+    proposed = set()
     for link in candidate_links(by_type, *_canonical(cur)):
+        proposed.add((ids[link["record"]], link["target_type"], link["target_id"]))
         cur.execute(
             "INSERT INTO library_links (record_id, target_type, target_id, basis) "
             "VALUES (%s, %s, %s, %s) ON CONFLICT DO NOTHING RETURNING id",
             (ids[link["record"]], link["target_type"], link["target_id"], link["basis"]))
         report["links_proposed"] += cur.fetchone() is not None
+    # Undecided candidates the matching no longer proposes are withdrawn; a
+    # link someone decided on (confirmed or rejected) is kept.
+    cur.execute("SELECT l.id, l.record_id, l.target_type, l.target_id FROM library_links l "
+                "JOIN library_records r ON r.id = l.record_id WHERE r.origin = %s "
+                "AND l.status = 'candidate' AND l.decided_by IS NULL", (origin,))
+    stale = [r["id"] for r in cur.fetchall()
+             if (r["record_id"], r["target_type"], r["target_id"]) not in proposed]
+    if stale:
+        cur.execute("DELETE FROM library_links WHERE id = ANY(%s)", (stale,))
+    report["links_withdrawn"] = len(stale)
     cur.execute("UPDATE library_imports SET report = %s WHERE id = %s",
                 (Jsonb(report), import_id))
     return {"import_id": import_id, **report}
@@ -685,18 +709,32 @@ def export(cur) -> Json:
     links = defaultdict(list)
     for r in cur.fetchall():
         links[r["record_id"]].append({k: v for k, v in r.items() if k != "record_id"})
+    cur.execute(
+        "SELECT f.record_id, f.attribute, f.value, f.state, f.source_uri, f.locator, "
+        "f.excerpt, f.note, r.assessor, r.task_key, r.created_at FROM library_findings f "
+        "JOIN library_research r ON r.id = f.research_id ORDER BY f.id")
+    findings = defaultdict(list)
+    for f in cur.fetchall():
+        findings[f["record_id"]].append({k: v for k, v in f.items() if k != "record_id"})
+    cur.execute("SELECT task_key, assessor, summary, recommendation, remaining_gaps, job_id, "
+                "created_at, (SELECT count(*) FROM library_findings f "
+                "WHERE f.research_id = r.id) AS findings FROM library_research r ORDER BY id")
+    research = defaultdict(list)
+    for r in cur.fetchall():
+        research[r["task_key"]].append({k: v for k, v in r.items() if k != "task_key"})
     records: dict[str, list[Json]] = defaultdict(list)
     by_type: dict[str, dict[str, Json]] = defaultdict(dict)
     for r in rows:
         item = {"key": r["external_key"], "id": r["record_id"], "name": r["name"],
                 "payload": r["payload"], "review_status": r["review_status"],
                 "in_latest_import": r["in_latest_import"],
-                "reviews": reviews.get(r["id"], []), "links": links.get(r["id"], [])}
+                "reviews": reviews.get(r["id"], []), "links": links.get(r["id"], []),
+                "findings": findings.get(r["id"], [])}
         records[r["entity_type"]].append(item)
         by_type[r["entity_type"]][r["record_id"]] = r["payload"]
     cur.execute("SELECT key, kind, subject, title, detail, priority, status, note, created_at, "
                 "resolved_at FROM library_tasks ORDER BY status, priority, key")
-    tasks = cur.fetchall()
+    tasks = [{**t, "research": research.get(t["key"], [])} for t in cur.fetchall()]
     assessments = {}
     for item in records.get("shared_modules", []):
         assessments[item["id"]] = assess_module(item["payload"], item["reviews"])
@@ -708,3 +746,365 @@ def export(cur) -> Json:
             "records": dict(records), "tasks": tasks, "module_assessments": assessments,
             "bootstrap_cycles": bootstrap_cycles(by_type), "edges": edges,
             "scopes": SCOPES, "audit_capture": list(AUDIT_CAPTURE)}
+
+
+# ---------------------------------------------------------------------------
+# AC working across the library (maintainer decision 2026-10-25): the
+# catalogue audit and module synthesis see it, the design-audit backlog
+# enters the catalogue, and library-research jobs work its open tasks
+# ---------------------------------------------------------------------------
+
+RESEARCH = "library-research"
+RESEARCH_PRIORITY = 0.5
+#: library-research jobs a calendar month (maintainer decision 2026-10-25).
+MONTHLY_QUOTA = 10
+#: Task kinds a research job can work, in the order they are taken (within
+#: a task's priority). Design audits of designs already in the catalogue go
+#: through the catalogue pipeline instead; cycles, scope, conflicts and
+#: package changes need a person.
+RESEARCHABLE = ("design-audit", "licence", "reconcile", "interface", "discovery",
+                "enterprise-evidence", "dependency")
+RECOMMENDATIONS = ("evidence-sufficient", "more-research", "not-findable")
+_KIND_INSTRUCTIONS = {
+    "design-audit": (
+        "Audit the design: find its exact current revision (release tag or commit, with "
+        "date), whether editable source files (CAD, drawings) are published, whether a "
+        "complete bill of materials exists, the licence of each asset (hardware, "
+        "documentation, software), and any record of a physical build or test. Give each "
+        "as a finding with attribute revision, editable_assets, bom, licence_hardware, "
+        "licence_documentation, licence_software, build_evidence or test_evidence."),
+    "licence": (
+        "Establish the licence terms of each asset of the design from its own licence "
+        "pages: what may be copied, changed and used commercially, and what may not. "
+        "Attribute: licence_hardware, licence_documentation or licence_software."),
+    "reconcile": (
+        "Compare the proposed capability with Applied Commons' own capabilities and need "
+        "categories given in context. Say which existing capability or category it "
+        "matches, overlaps or extends, or that it is new. Attribute: matches, overlaps, "
+        "extends or new, with the existing code or name as value. This is a proposal for "
+        "the maintainer; it is not a link."),
+    "interface": (
+        "Find published specifications for the shared module's interface parameters "
+        "(dimensions, loads, duty, power, protocols, environmental limits) in the module's "
+        "sources or comparable open designs, and any record of the same module being used "
+        "on two machines, repaired, or built independently. Attribute: the parameter "
+        "name, or interoperability, repairability or independent_reproduction."),
+    "discovery": (
+        "Follow the discovery lead: find current open designs with published plans for "
+        "what it asks. Attribute: design, with the name and URL as value."),
+    "enterprise-evidence": (
+        "Find published evidence for the enterprise in comparable small-scale settings: "
+        "market prices, demand, channels, input and labour costs, and capacity. Keep "
+        "technical, market and economic evidence apart, and give place, date and currency "
+        "for every figure. Attribute: price, demand, channel, cost_<item>, labour, "
+        "capacity. A figure from another place or year is context, not this community's."),
+    "dependency": (
+        "Find supply facts for the external dependency: typical suppliers and their "
+        "number, lead times, interchangeability and standard sizes, and how concentrated "
+        "supply is. Attribute: supplier_count, lead_time_days, substitutability, "
+        "concentration_risk or standard."),
+}
+
+
+class Finding(BaseModel):
+    attribute: str = Field(min_length=1, max_length=100)
+    value: Any = None
+    state: str = "INFERRED"
+    source_uri: str | None = Field(default=None, max_length=2000)
+    locator: str = Field(default="", max_length=300)
+    excerpt: str = Field(default="", max_length=1000)
+    note: str = Field(default="", max_length=1000)
+    record: str | None = Field(default=None, max_length=300)
+
+    @field_validator("locator", "excerpt", "note", mode="before")
+    @classmethod
+    def _clip(cls, value, info):
+        return str(value or "")[:{"locator": 300, "excerpt": 1000, "note": 1000}[info.field_name]]
+
+    @model_validator(mode="after")
+    def _honest(self):
+        state = str(self.state or "").upper()
+        self.state = state if state in STATES else "INFERRED"
+        if self.source_uri and not re.match(r"^https?://\S+$", self.source_uri):
+            self.source_uri = None
+        if self.state == "SUPPORTED" and not self.source_uri:
+            self.state = "INFERRED"  # a claim without a source is not supported
+            self.note = (self.note + " (no source given: kept as INFERRED)").strip()
+        return self
+
+
+class ResearchResult(BaseModel):
+    summary: str = Field(default="", max_length=4000)
+    claims: list[Finding] = Field(default_factory=list)
+    remaining_gaps: list[str] = Field(default_factory=list)
+    recommendation: str = "more-research"
+
+    @field_validator("claims", mode="before")
+    @classmethod
+    def _cap(cls, items):
+        return list(items or [])[:40]
+
+    @field_validator("remaining_gaps", mode="before")
+    @classmethod
+    def _gaps(cls, items):
+        return [str(i)[:500] for i in list(items or [])[:20]]
+
+    @field_validator("recommendation")
+    @classmethod
+    def _recommendation(cls, value):
+        value = str(value or "").strip().lower()
+        return value if value in RECOMMENDATIONS else "more-research"
+
+
+def _record(cur, external_key: str) -> Json | None:
+    cur.execute("SELECT id, external_key, entity_type, record_id, name, payload "
+                "FROM library_records WHERE external_key = %s", (external_key,))
+    return cur.fetchone()
+
+
+def _origin(cur) -> str | None:
+    cur.execute("SELECT origin FROM library_imports ORDER BY id DESC LIMIT 1")
+    row = cur.fetchone()
+    return row["origin"] if row else None
+
+
+def research_due(cur, budget: int) -> list[Json]:
+    """Open library tasks a research job can take this month, best first,
+    within the monthly quota; one job per task."""
+    cur.execute("SELECT count(*) AS n FROM jobs WHERE job_type = %s "
+                "AND created_at >= date_trunc('month', NOW())", (RESEARCH,))
+    room = min(budget, MONTHLY_QUOTA - cur.fetchone()["n"])
+    if room <= 0:
+        return []
+    # Taken in turn across kinds, so every kind of research moves each month
+    # (32 reconciliations would otherwise take the quota for three months).
+    cur.execute(
+        """
+        SELECT * FROM (
+            SELECT t.*, row_number() OVER (PARTITION BY t.kind
+                                           ORDER BY t.priority, t.key) AS turn
+            FROM library_tasks t
+            WHERE t.status = 'open' AND t.kind = ANY(%s)
+              AND NOT EXISTS (SELECT 1 FROM jobs j WHERE j.unit_key = %s || ':' || t.key)
+              -- a design already in the catalogue is audited by the catalogue pipeline
+              AND NOT (t.kind = 'design-audit' AND EXISTS (
+                  SELECT 1 FROM library_links l JOIN library_records r ON r.id = l.record_id
+                  WHERE r.entity_type || ':' || r.record_id = t.subject
+                    AND l.target_type = 'project' AND l.status <> 'rejected'))
+        ) due
+        ORDER BY turn, priority, array_position(%s, kind), key
+        LIMIT %s
+        """,
+        (list(RESEARCHABLE), RESEARCH, list(RESEARCHABLE), room))
+    return [{k: v for k, v in r.items() if k != "turn"} for r in cur.fetchall()]
+
+
+def research_input(cur, task: Json) -> Json:
+    """What a research job needs: the task, its record, the records it
+    refers to by name, and for reconciliation AC's own capabilities."""
+    origin = _origin(cur)
+    subject = _record(cur, f"{origin}:{task['subject']}") if task.get("subject") else None
+    context: Json = {}
+    if subject:
+        refs = set()
+        for value in subject["payload"].values():
+            if isinstance(value, dict) and len(value) == 1 and next(iter(value)) in (
+                    "all_of", "any_of", "ref_id"):
+                try:
+                    refs |= set(expression_refs(value))
+                except ValueError:
+                    pass
+        for field in ("source_ids", "item_ids", "component_flow_ids", "flow_ids",
+                      "process_route_ids"):
+            refs |= set(subject["payload"].get(field) or [])
+        if refs:
+            cur.execute("SELECT record_id, entity_type, name, payload->>'url' AS url "
+                        "FROM library_records WHERE origin = %s AND record_id = ANY(%s)",
+                        (origin, sorted(refs)))
+            context["referenced"] = {r["record_id"]: {k: v for k, v in r.items()
+                                                      if k != "record_id" and v}
+                                     for r in cur.fetchall()}
+    if task["kind"] == "reconcile":
+        cur.execute(
+            """
+            SELECT c.code, c.name, c.status,
+                   array_remove(array_agg(DISTINCT nc.name), NULL) AS categories
+            FROM capabilities c
+            LEFT JOIN capability_links cl ON cl.capability_id = c.id AND cl.status = 'active'
+            LEFT JOIN need_categories nc ON nc.id = cl.category_id
+            WHERE c.status <> 'rejected' GROUP BY c.id ORDER BY c.code
+            """)
+        context["ac_capabilities"] = cur.fetchall()
+        cur.execute("SELECT name, layer, COALESCE(track, 'need') AS track FROM need_categories "
+                    "ORDER BY layer NULLS LAST, name")
+        context["ac_categories"] = cur.fetchall()
+    return {
+        "task": {k: task[k] for k in ("key", "kind", "title", "detail")},
+        "record": ({"key": subject["external_key"], "name": subject["name"],
+                    "payload": subject["payload"]} if subject else None),
+        "context": context,
+        "instructions": (
+            "Applied Commons is mapping the means of production for a small community farm "
+            "and workshop in a regional network of specialist producers. Its production "
+            "library is an outside planning package: its records are unverified seeds and "
+            "proposals. Research the open task below. "
+            + _KIND_INSTRUCTIONS.get(task["kind"], "")
+            + " Give each fact as a claim with an attribute, a value, an evidence state "
+            "(SUPPORTED only with a source URL you retrieved and a locator such as a page or "
+            "section; INFERRED for your own reasoning, saying its basis in note; UNKNOWN when "
+            "you looked and could not find it; CONFLICTED when sources disagree, one claim "
+            "per source), and a short excerpt. Never turn a missing value into zero or a "
+            "guess, and never present a located source as a validated design. In record, "
+            "give the library key a claim is about when it is not the task's own record. "
+            "List what is still missing in remaining_gaps, and recommend evidence-sufficient "
+            "(a person can now close the task), more-research or not-findable. "
+            + _research._COMMON),
+        "output_format": (
+            '{"summary": "<one paragraph>", "claims": [{"attribute": "", "value": null, '
+            '"state": "SUPPORTED|INFERRED|UNKNOWN|CONFLICTED", "source_uri": "<url>", '
+            '"locator": "", "excerpt": "", "note": "", "record": "<library key, optional>"}], '
+            '"remaining_gaps": [""], "recommendation": '
+            '"evidence-sufficient|more-research|not-findable", "evidence": [{"source_uri": '
+            '"<url>", "title": "", "source_type": ""}]}'),
+    }
+
+
+def store_research(cur, task_key: str, result: ResearchResult, assessor: str,
+                   job_id: int | None = None) -> Json | None:
+    """Record one research run on a task: its summary and sourced findings.
+    It verifies nothing and closes nothing."""
+    cur.execute("SELECT key, subject FROM library_tasks WHERE key = %s", (task_key,))
+    task = cur.fetchone()
+    if task is None:
+        return None
+    origin = _origin(cur)
+    cur.execute(
+        "INSERT INTO library_research (task_key, job_id, assessor, summary, recommendation, "
+        "remaining_gaps) VALUES (%s, %s, %s, %s, %s, %s) RETURNING id",
+        (task_key, job_id, assessor[:200], result.summary, result.recommendation,
+         Jsonb(result.remaining_gaps)))
+    research_id = cur.fetchone()["id"]
+    stored = 0
+    for f in result.claims:
+        key = f.record or (f"{origin}:{task['subject']}" if task["subject"] else None)
+        record = _record(cur, key) if key and ":" in key else None
+        cur.execute(
+            "INSERT INTO library_findings (research_id, record_id, attribute, value, state, "
+            "source_uri, locator, excerpt, note) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
+            (research_id, record["id"] if record else None, f.attribute, Jsonb(f.value),
+             f.state, f.source_uri, f.locator, f.excerpt, f.note))
+        stored += 1
+    return {"research_id": research_id, "findings": stored,
+            "recommendation": result.recommendation}
+
+
+def audit_summary(cur) -> Json | None:
+    """The library as the monthly catalogue audit sees it: where local
+    systems lack core equipment, which proposed capabilities have no
+    located design, and what is still open. None before an import."""
+    origin = _origin(cur)
+    if origin is None:
+        return None
+    cur.execute("SELECT entity_type, record_id, name, payload FROM library_records "
+                "WHERE origin = %s AND entity_type = ANY(%s)",
+                (origin, ["community_systems", "community_scope", "coverage_matrix",
+                          "external_dependencies"]))
+    by: dict[str, list[Json]] = defaultdict(list)
+    for r in cur.fetchall():
+        by[r["entity_type"]].append(r)
+    scope_counts: dict[str, Counter] = defaultdict(Counter)
+    for r in by["community_scope"]:
+        for sid in r["payload"].get("community_system_ids") or []:
+            scope_counts[sid][r["payload"].get("scope")] += 1
+    cur.execute("SELECT kind, count(*) AS n FROM library_tasks WHERE status = 'open' "
+                "GROUP BY kind")
+    return {
+        "note": ("An outside planning package: proposals and unverified seeds, not "
+                 "evidence. A gap it suggests still needs a reference or a brief."),
+        "local_systems": [{"name": r["name"],
+                           "service_outcome": r["payload"].get("service_outcome"),
+                           "scope_counts": dict(scope_counts[r["record_id"]])}
+                          for r in sorted(by["community_systems"], key=lambda r: r["record_id"])],
+        "capability_coverage": [{"capability": r["name"],
+                                 "coverage_state": r["payload"].get("coverage_state"),
+                                 "located_designs": r["payload"].get("located_design_count")}
+                                for r in sorted(by["coverage_matrix"], key=lambda r: r["record_id"])],
+        "external_dependencies": sorted(r["name"] for r in by["external_dependencies"]),
+        "open_tasks": {r["kind"]: r["n"] for r in cur.fetchall()},
+    }
+
+
+def module_proposals(cur, category_name: str, limit: int = 6) -> Json | None:
+    """The library's shared-module proposals and external dependencies for
+    a module-synthesis domain: proposals to reconcile, never specifications."""
+    domains = {d for d, names in DOMAIN_CATEGORIES.items() if category_name in names}
+    origin = _origin(cur)
+    if not domains or origin is None:
+        return None
+    cur.execute("SELECT entity_type, record_id, name, payload FROM library_records "
+                "WHERE origin = %s AND entity_type = ANY(%s)",
+                (origin, ["capabilities", "industries", "shared_modules",
+                          "external_dependencies"]))
+    by: dict[str, list[Json]] = defaultdict(list)
+    for r in cur.fetchall():
+        by[r["entity_type"]].append(r)
+    caps = {r["record_id"] for r in by["capabilities"] if r["payload"].get("domain") in domains}
+    industries = {r["record_id"] for r in by["industries"]
+                  if caps & set(r["payload"].get("capability_ids") or [])}
+    modules = [{"name": r["name"], "compatibility": r["payload"].get("compatibility_status"),
+                "interface_parameters": [p.get("parameter") for p in
+                                         r["payload"].get("interface_requirements") or []],
+                "validation_needed": r["payload"].get("validation_needed") or []}
+               for r in by["shared_modules"]
+               if industries & set(r["payload"].get("candidate_industry_ids") or [])][:limit]
+    dependencies = [{"name": r["name"], "remaining_limit": r["payload"].get("remaining_limit")}
+                    for r in by["external_dependencies"]
+                    if industries & set(r["payload"].get("industry_ids") or [])][:limit]
+    if not modules and not dependencies:
+        return None
+    return {"shared_modules": modules, "external_dependencies": dependencies}
+
+
+def backlog_designs_without_project(cur) -> list[Json]:
+    """Design-audit backlog designs not yet linked to a catalogue project,
+    with what a suggestion needs (section 4l: the backlog enters the
+    catalogue as maintainer priorities)."""
+    origin = _origin(cur)
+    if origin is None:
+        return []
+    cur.execute(
+        """
+        SELECT d.id, d.record_id, d.name, d.payload, b.payload AS audit
+        FROM library_records b
+        JOIN library_records d ON d.origin = b.origin AND d.entity_type = 'designs'
+                              AND d.record_id = b.payload->>'design_id'
+        WHERE b.origin = %s AND b.entity_type = 'design_audit_backlog'
+          AND d.review_status <> 'rejected'
+          AND NOT EXISTS (SELECT 1 FROM library_links l WHERE l.record_id = d.id
+                          AND l.target_type = 'project' AND l.status <> 'rejected')
+        ORDER BY b.record_id
+        """, (origin,))
+    rows = cur.fetchall()
+    out = []
+    for r in rows:
+        audit = r["audit"]
+        cur.execute("SELECT payload FROM library_records WHERE origin = %s AND "
+                    "entity_type = 'sources' AND record_id = ANY(%s)",
+                    (origin, list(r["payload"].get("source_ids") or [])))
+        urls = [s["payload"].get("url") for s in cur.fetchall() if s["payload"].get("url")]
+        cur.execute("SELECT payload FROM library_records WHERE origin = %s AND "
+                    "entity_type = 'community_systems' AND record_id = %s",
+                    (origin, audit.get("community_system_id")))
+        system = cur.fetchone()
+        cur.execute("SELECT payload->>'domain' AS domain FROM library_records WHERE origin = %s "
+                    "AND entity_type = 'capabilities' AND record_id = ANY(%s)",
+                    (origin, list((system or {}).get("payload", {}).get("capability_ids") or [])))
+        categories = [c for row in cur.fetchall() for c in DOMAIN_CATEGORIES.get(row["domain"], [])]
+        out.append({
+            "record_id": r["id"], "design": r["record_id"], "name": r["name"],
+            "categories": categories or ["Fabrication and tools"], "source_uris": urls,
+            "summary": (f"{r['name']}: a design in the production library's audit backlog "
+                        f"({audit.get('record_id') or audit.get('audit_id')}, "
+                        f"{audit.get('workstream')}). {audit.get('acceptance_task')}"),
+            "note": f"design-audit backlog {audit.get('audit_id')} ({r['record_id']})"})
+    return out

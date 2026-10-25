@@ -45,7 +45,7 @@ def clean(client):
             "TRUNCATE jobs, findings, evidence, questions, projects, sites, modules, "
             "systems, standards, roadmaps, graph_updates, graph_sources, needs, "
             "capabilities, graph_assessments, design_preservation, library_imports, "
-            "library_records, library_tasks RESTART IDENTITY CASCADE"
+            "library_records, library_tasks, library_research RESTART IDENTITY CASCADE"
         )
         conn.execute("UPDATE need_categories SET solved_at = NULL, solved_note = NULL")
     yield
@@ -2757,3 +2757,130 @@ def test_library_reviews_links_and_tasks(client):
 
 def test_library_export_before_any_import(client):
     assert client.get("/library/export").json() == {"imported": False}
+
+
+def test_the_design_audit_backlog_enters_the_catalogue_once(client):
+    client.post("/library/import", json=lib_package())
+    step = discover(client)
+    [added] = step["library_backlog"]
+    assert (added["design"], added["link"]) == ("DES09", "confirmed")
+    [(name, status, priority, category)] = sql(
+        "SELECT p.name, p.status, p.priority, c.name FROM projects p "
+        "JOIN need_categories c ON c.id = p.category_id WHERE p.id = %s", added["project_id"])
+    assert (name, status, priority, category) == ("Example pump", "candidate", True,
+                                                  "Fabrication and tools")
+    assert discover(client)["library_backlog"] == []
+    assert sql("SELECT count(*) FROM projects WHERE name = 'Example pump'") == [(1,)]
+
+
+def test_a_backlog_design_already_in_the_catalogue_is_not_added_again(client):
+    pid = project(client, code="PUMP-1")
+    sql("UPDATE projects SET source_uris = %s::jsonb WHERE id = %s",
+        json.dumps(["https://github.com/example/pump"]), pid)
+    client.post("/library/import", json=lib_package())  # proposes a same-source link
+    assert discover(client)["library_backlog"] == []
+
+
+def test_library_research_jobs_follow_the_open_tasks_within_the_quota(client):
+    client.post("/library/import", json=lib_package())
+    jobs = discover(client)["library_research"]
+    keys = {j["unit_key"].split(":", 1)[1] for j in jobs}
+    # DES09 is in the catalogue now (backlog): its audit is the catalogue's work.
+    assert keys == {"design-audit:DES10", "licence:DES10", "reconcile:CAP15",
+                    "interface:MOD01", "enterprise-evidence:ENT01", "enterprise-evidence:ENT02"}
+    assert discover(client)["library_research"] == []
+    [(payload,)] = sql("SELECT input FROM jobs WHERE unit_key = 'library-research:reconcile:CAP15'")
+    assert payload["record"]["name"] == "Collect and store water"
+    assert "ac_categories" in payload["context"] and "SUPPORTED only with a source" in \
+        payload["instructions"]
+
+
+def test_the_monthly_research_quota_is_kept(client):
+    client.post("/library/import", json=lib_package())
+    for i in range(9):
+        sql("INSERT INTO jobs (job_type, worker, priority, input, unit_key) VALUES "
+            "('library-research', 'unassigned', 0.5, '{}', %s)", f"library-research:old-{i}")
+    assert len(discover(client)["library_research"]) == 1
+
+
+def test_research_findings_are_stored_honestly_and_close_nothing(client):
+    client.post("/library/import", json=lib_package())
+    discover(client)
+    job = claim(client, APOLLO, ["library-research"]).json()["job"]
+    task_key = job["input"]["task"]["key"]
+    r = client.post(f"/jobs/{job['id']}/complete", json={"worker": APOLLO, "output": {
+        "summary": "Looked.", "recommendation": "maybe",
+        "claims": [
+            {"attribute": "licence_hardware", "value": "CC BY-NC-SA 4.0", "state": "SUPPORTED",
+             "source_uri": "https://example.org/licence", "locator": "section 2"},
+            {"attribute": "revision", "value": "v4.1", "state": "SUPPORTED"},  # no source
+            {"attribute": "bom", "value": None, "state": "UNKNOWN"}]}})
+    assert r.status_code == 200, r.text
+    assert r.json()["library_research"]["findings"] == 3
+    rows = sql("SELECT attribute, state FROM library_findings ORDER BY id")
+    assert rows == [("licence_hardware", "SUPPORTED"), ("revision", "INFERRED"), ("bom", "UNKNOWN")]
+    assert sql("SELECT recommendation FROM library_research") == [("more-research",)]
+    assert sql("SELECT status FROM library_tasks WHERE key = %s", task_key) == [("open",)]
+    assert sql("SELECT DISTINCT review_status FROM library_records") == [("staged",)]
+    export = client.get("/library/export").json()
+    [task] = [t for t in export["tasks"] if t["key"] == task_key]
+    assert task["research"][0]["findings"] == 3
+    assert any(r["findings"] for rs in export["records"].values() for r in rs)
+
+
+def test_research_can_be_recorded_by_hand(client):
+    client.post("/library/import", json=lib_package())
+    body = {"task_key": "dependency:DEP99", "assessor": "Claude Code session (maintainer)",
+            "summary": "s", "claims": []}
+    assert client.post("/library/research", json=body).status_code == 404
+    r = client.post("/library/research", json={
+        **body, "task_key": "interface:MOD01", "recommendation": "not-findable",
+        "claims": [{"attribute": "Shaft and coupling", "value": None, "state": "UNKNOWN",
+                      "note": "No drawing published."}]})
+    assert r.status_code == 200, r.text
+    assert sql("SELECT assessor, recommendation FROM library_research") == [
+        ("Claude Code session (maintainer)", "not-findable")]
+
+
+def test_the_catalogue_audit_and_module_synthesis_see_the_library(client):
+    import modular
+
+    screened(10)
+    client.post("/library/import", json=lib_package())
+    discover(client)
+    [(payload,)] = sql("SELECT input FROM jobs WHERE job_type = 'catalogue-audit'")
+    assert "production_library" in payload and "the production library" in payload["instructions"]
+    assert payload["production_library"]["open_tasks"]["design-audit"] >= 1
+    proposals = {"shared_modules": [{"name": "Shared rotary drive"}], "external_dependencies": []}
+    out = modular.module_input({"name": "Water"}, None, [], [], [], library=proposals)
+    assert out["library_proposals"] == proposals and "never treat" in out["library_note"]
+    assert "library_proposals" not in modular.module_input({"name": "Water"}, None, [], [], [])
+
+
+def test_library_research_takes_kinds_in_turn(client, monkeypatch):
+    import library
+    monkeypatch.setattr(library, "MONTHLY_QUOTA", 4)
+    client.post("/library/import", json=lib_package())
+    sql("UPDATE library_tasks SET priority = 1 WHERE kind = 'enterprise-evidence'")
+    keys = [j["unit_key"].split(":", 1)[1] for j in discover(client)["library_research"]]
+    # one of each kind before a second of any: both enterprise tasks are priority 1
+    assert len(keys) == 4 and len({k.split(":")[0] for k in keys}) == 4
+
+
+def test_withdrawn_candidates_go_and_decided_links_stay(client):
+    pid = project(client, code="PUMP-1")
+    sql("UPDATE projects SET source_uris = %s::jsonb WHERE id = %s",
+        json.dumps(["https://github.com/example/pump"]), pid)
+    client.post("/library/import", json=lib_package())
+    assert sql("SELECT count(*) FROM library_links WHERE target_type = 'project'") == [(1,)]
+    sql("UPDATE projects SET source_uris = '[]'::jsonb")
+    report = client.post("/library/import", json=lib_package()).json()
+    assert report["links_withdrawn"] == 1
+    sql("UPDATE projects SET source_uris = %s::jsonb", json.dumps(["https://github.com/example/pump"]))
+    client.post("/library/import", json=lib_package())
+    [(link_id,)] = sql("SELECT id FROM library_links WHERE target_type = 'project'")
+    client.post(f"/library/links/{link_id}/decision", json={"status": "rejected",
+                                                           "decided_by": "karl"})
+    sql("UPDATE projects SET source_uris = '[]'::jsonb")
+    client.post("/library/import", json=lib_package())
+    assert sql("SELECT status FROM library_links WHERE id = %s", link_id) == [("rejected",)]
