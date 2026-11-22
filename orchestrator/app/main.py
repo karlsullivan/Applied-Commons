@@ -3898,6 +3898,64 @@ def _store_review(cur, job, review) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Recovery of a failed job from a result its worker did return
+# ---------------------------------------------------------------------------
+
+RECOVERY_WORKER = "maintainer-recovery"
+
+
+class JobRecover(BaseModel):
+    output: dict[str, Any]
+    recovered_by: str = Field(min_length=2, max_length=200)
+    source: str = Field(default="", max_length=500)
+
+
+@app.post("/jobs/{job_id}/recover")
+def recover_job(job_id: int, item: JobRecover):
+    """Complete a job that failed for good from a result its worker did
+    return, for example one refused by a limit that has since been relaxed.
+
+    The result goes through the same validation and storage as
+    ``/jobs/{id}/complete``. The job's worker becomes
+    ``maintainer-recovery``, and its output records who recovered it, from
+    where, and the error it had failed with. If the result is refused, the
+    job stays failed exactly as it was.
+    """
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT status, worker, error, completed_at FROM jobs "
+                "WHERE id = %s FOR UPDATE", (job_id,))
+            before = cur.fetchone()
+            if before is None:
+                raise HTTPException(status_code=404, detail="Job not found")
+            if before["status"] != "failed":
+                raise HTTPException(status_code=409,
+                                    detail="only a failed job can be recovered")
+            cur.execute(
+                "UPDATE jobs SET status = 'running', worker = %s, "
+                "lease_until = NOW() + INTERVAL '15 minutes' WHERE id = %s",
+                (RECOVERY_WORKER, job_id))
+        conn.commit()
+    output = {**item.output, "recovered": {
+        "by": item.recovered_by, "source": item.source,
+        "failed_with": before["error"]}}
+    try:
+        return complete_job(job_id, JobComplete(worker=RECOVERY_WORKER, output=output))
+    except Exception:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE jobs SET status = 'failed', worker = %s, error = %s, "
+                    "completed_at = %s, lease_until = NULL "
+                    "WHERE id = %s AND status = 'running' AND worker = %s",
+                    (before["worker"], before["error"], before["completed_at"],
+                     job_id, RECOVERY_WORKER))
+            conn.commit()
+        raise
+
+
+# ---------------------------------------------------------------------------
 # Job failure / retry
 # ---------------------------------------------------------------------------
 

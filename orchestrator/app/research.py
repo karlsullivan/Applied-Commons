@@ -241,6 +241,43 @@ def _check_texts(items: list[str], low: int, high: int) -> list[str]:
     return items
 
 
+# Lenient limits (2026-11-22). Results were being rejected whole, after
+# hours of research, because one descriptive field ran long (a time
+# estimate over 300 characters, 16 repositories, 13 review gaps). For
+# those fields an over-long value is now shortened rather than refused:
+# text is cut at the limit and ends in an ellipsis, and a list keeps its
+# first entries plus a note saying how many were left out.
+ELLIPSIS = "…"
+
+
+def clip_text(value: Any, limit: int) -> Any:
+    """Cut a string to ``limit`` characters, ending in an ellipsis."""
+    if isinstance(value, str) and len(value) > limit:
+        return value[:limit - 1].rstrip() + ELLIPSIS
+    return value
+
+
+def clip_list(items: Any, limit: int, what: str) -> tuple[Any, str | None]:
+    """Keep the first ``limit`` entries of a list. Returns the list and a
+    note on what was left out (None when nothing was)."""
+    if not isinstance(items, list) or len(items) <= limit:
+        return items, None
+    return items[:limit], (f"{len(items) - limit} further {what} listed by the "
+                           f"researcher were left out (limit {limit})")
+
+
+def clip_gaps(items: Any, limit: int, text_limit: int = 600) -> Any:
+    """Gap lists: entries cut to ``text_limit`` characters; past ``limit``
+    entries, the last one kept says how many more there were."""
+    if not isinstance(items, list):
+        return items
+    items = [clip_text(i, text_limit) for i in items]
+    if len(items) <= limit:
+        return items
+    return items[:limit - 1] + [f"... and {len(items) - limit + 1} more gaps "
+                                f"listed by the researcher (limit {limit})"]
+
+
 def _check_url(value: str | None, *, https_only: bool = False) -> str | None:
     if not value:
         return None
@@ -269,12 +306,20 @@ class NeedBriefResult(BaseModel):
     brief: NeedBrief
 
 
+#: Lenient limits (see clip_text): longer values are shortened, not refused.
+REVIEW_GAPS = 20
+TIME_ESTIMATE_CHARS = 1000
+DESIGN_REPOSITORIES = 30
+DESIGN_FILES = 100
+BUILD_GAPS = 20
+
+
 class Review(BaseModel):
     decision: Literal["build", "continue", "park"]
     scores: dict[str, float]
     fit: str = Field(min_length=10, max_length=4000)
     rationale: str = Field(min_length=20, max_length=4000)
-    gaps: list[str] = Field(default_factory=list, max_length=10)
+    gaps: list[str] = Field(default_factory=list, max_length=REVIEW_GAPS)
     questions: list[str] = Field(default_factory=list, max_length=3)
     climates: list[str] = Field(default_factory=list, max_length=5)
 
@@ -287,6 +332,11 @@ class Review(BaseModel):
     @classmethod
     def _scores(cls, scores):
         return _check_scores(scores)
+
+    @field_validator("gaps", mode="before")
+    @classmethod
+    def _clip_gaps(cls, items):
+        return clip_gaps(items, REVIEW_GAPS)
 
     @field_validator("gaps")
     @classmethod
@@ -363,8 +413,9 @@ class DesignFile(BaseModel):
 
 
 class Design(BaseModel):
-    repositories: list[Repository] = Field(default_factory=list, max_length=10)
-    files: list[DesignFile] = Field(default_factory=list, max_length=100)
+    repositories: list[Repository] = Field(default_factory=list,
+                                           max_length=DESIGN_REPOSITORIES)
+    files: list[DesignFile] = Field(default_factory=list, max_length=DESIGN_FILES)
 
 
 class Step(BaseModel):
@@ -376,8 +427,13 @@ class Step(BaseModel):
 class Assembly(BaseModel):
     tools: list[str] = Field(default_factory=list, max_length=60)
     skills: list[str] = Field(default_factory=list, max_length=30)
-    time_estimate: str = Field(default="", max_length=300)
+    time_estimate: str = Field(default="", max_length=TIME_ESTIMATE_CHARS)
     steps: list[Step] = Field(min_length=1, max_length=150)
+
+    @field_validator("time_estimate", mode="before")
+    @classmethod
+    def _clip_time(cls, value):
+        return clip_text(value, TIME_ESTIMATE_CHARS)
 
 
 class Criterion(BaseModel):
@@ -409,11 +465,21 @@ def validate_build(section: str, output: dict) -> dict:
     build = output.get("build")
     if not isinstance(build, dict):
         raise ValueError("a build pack result needs a 'build' object")
+    build, notes = dict(build), []
+    if section == "design":
+        for key, limit in (("repositories", DESIGN_REPOSITORIES),
+                           ("files", DESIGN_FILES)):
+            build[key], note = clip_list(build.get(key, []), limit,
+                                         "repositories" if key == "repositories"
+                                         else "design files")
+            if note:
+                notes.append(note)
     body = SECTION_MODELS[section](**build).model_dump()
     gaps = build.get("gaps") or []
     if not isinstance(gaps, list):
         raise ValueError("gaps must be a list")
-    body["gaps"] = _check_texts([str(g) for g in gaps[:20]], 1, 600)
+    gaps = clip_gaps([str(g) for g in gaps], BUILD_GAPS - len(notes))
+    body["gaps"] = _check_texts(gaps + notes, 1, 600)
     return body
 
 
@@ -658,7 +724,8 @@ def review_input(project: dict, review_number: int) -> dict[str, Any]:
             "public material; 'continue' only when up to 3 specific questions "
             "would settle the decision"
             + (" (this is the last review: decide build or park)" if last else "")
-            + ". List gaps: what the upstream project does not document. "
+            + ". List gaps: what the upstream project does not document, "
+            + "most important first. "
             + "List climates, revising the assessment's with the evidence now "
             + "available. " + _CLIMATE_GUIDE + " "
             + _COMMON
@@ -711,7 +778,8 @@ _SECTION_TASKS = {
         "the project's own instructions and builders' reports; where the "
         "upstream instructions skip a step, fill it only from a cited "
         "source and say so.",
-        '{"tools": [""], "skills": [""], "time_estimate": "", "steps": '
+        '{"tools": [""], "skills": [""], "time_estimate": "<one or two '
+        'sentences>", "steps": '
         '[{"step": "", "detail": "", "safety": ""}], "gaps": ["<undocumented '
         'step>"]}',
     ),

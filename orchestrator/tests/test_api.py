@@ -670,6 +670,104 @@ def test_invalid_build_sections_write_nothing(client, section, body):
     assert sql("SELECT count(*) FROM build_packs") == [(0,)]
 
 
+def build_job(client, section):
+    pid = project(client)
+    job_id = client.post("/jobs", json={"project_id": pid, "job_type": "build-pack",
+                                        "input": {"section": section}}).json()["id"]
+    return pid, job_id
+
+
+def test_long_descriptive_fields_are_shortened_not_refused(client):
+    pid, job_id = build_job(client, "assembly")
+    claim(client, APOLLO, ["build-pack"])
+    long_estimate = "DIY: 2-6 hours. " + "x" * 1200
+    r = client.post(f"/jobs/{job_id}/complete", json={"worker": APOLLO, "output": {
+        "summary": "s", "build": {"time_estimate": long_estimate,
+                                  "steps": [{"step": "Wash the sand"}],
+                                  "gaps": ["g" * 700]}}})
+    assert r.status_code == 200, r.text
+    [(content,)] = sql("SELECT content FROM build_packs WHERE project_id = %s", pid)
+    assert len(content["time_estimate"]) == 1000
+    assert content["time_estimate"].startswith("DIY: 2-6 hours.")
+    assert content["time_estimate"].endswith("…")
+    assert len(content["gaps"][0]) == 600
+
+
+def test_long_design_lists_keep_their_first_entries_and_say_so(client):
+    import research
+
+    pid, job_id = build_job(client, "design")
+    claim(client, APOLLO, ["build-pack"])
+    repos = [{"url": f"https://github.com/example/r{i}", "licence": "GPL-3.0"}
+             for i in range(35)]
+    r = client.post(f"/jobs/{job_id}/complete", json={"worker": APOLLO, "output": {
+        "summary": "s", "build": {"repositories": repos, "files": [],
+                                  "gaps": [f"gap {i}" for i in range(25)]}}})
+    assert r.status_code == 200, r.text
+    [(content,)] = sql("SELECT content FROM build_packs WHERE project_id = %s", pid)
+    assert [x["url"] for x in content["repositories"]] == [x["url"] for x in repos[:30]]
+    assert len(content["gaps"]) == research.BUILD_GAPS
+    assert content["gaps"][-1] == ("5 further repositories listed by the researcher "
+                                   "were left out (limit 30)")
+    assert content["gaps"][-2].startswith("... and 7 more gaps")
+    # 16 repositories (job 716's case) are simply accepted.
+    assert len(research.validate_build("design", {"build": {"repositories": repos[:16]}})
+               ["repositories"]) == 16
+
+
+def test_a_review_with_many_gaps_is_accepted():
+    import research
+
+    review = research.Review(**{**review_output("park")["review"],
+                                "gaps": [f"Missing drawing {i}" for i in range(13)]})
+    assert len(review.gaps) == 13
+    many = research.Review(**{**review_output("park")["review"],
+                              "gaps": [f"Missing drawing {i}" for i in range(30)]})
+    assert len(many.gaps) == 20 and many.gaps[-1].startswith("... and 11 more gaps")
+
+
+def fail_for_good(client, job_id, error="invalid result for build-pack: too long"):
+    for _ in range(3):
+        assert claim(client, APOLLO, ["build-pack"]).json()["job"]["id"] == job_id
+        client.post(f"/jobs/{job_id}/fail", json={"worker": APOLLO, "error": error})
+    [(status,)] = sql("SELECT status FROM jobs WHERE id = %s", job_id)
+    assert status == "failed"
+
+
+def test_a_failed_job_is_recovered_from_its_workers_result(client):
+    pid, job_id = build_job(client, "assembly")
+    fail_for_good(client, job_id)
+    r = client.post(f"/jobs/{job_id}/recover", json={
+        "recovered_by": "maintainer (test)", "source": "hermes t_abc",
+        "output": {"summary": "s", "build": {**BUILD["assembly"],
+                                             "time_estimate": "y" * 400}}})
+    assert r.status_code == 200, r.text
+    [(status, worker, error, output)] = sql(
+        "SELECT status, worker, error, output FROM jobs WHERE id = %s", job_id)
+    assert (status, worker, error) == ("completed", "maintainer-recovery", None)
+    assert output["recovered"] == {"by": "maintainer (test)", "source": "hermes t_abc",
+                                   "failed_with": "invalid result for build-pack: too long"}
+    assert sql("SELECT section FROM build_packs WHERE project_id = %s", pid) == [("assembly",)]
+    # Only a failed job can be recovered.
+    assert client.post(f"/jobs/{job_id}/recover", json={
+        "recovered_by": "maintainer (test)", "output": {}}).status_code == 409
+    assert client.post("/jobs/999/recover", json={
+        "recovered_by": "maintainer (test)", "output": {}}).status_code == 404
+
+
+def test_a_refused_recovery_leaves_the_job_failed_as_it_was(client):
+    pid, job_id = build_job(client, "assembly")
+    fail_for_good(client, job_id)
+    before = sql("SELECT status, worker, error, completed_at FROM jobs WHERE id = %s", job_id)
+    r = client.post(f"/jobs/{job_id}/recover", json={
+        "recovered_by": "maintainer (test)",
+        "output": {"summary": "s", "build": {"tools": ["x"]}}})  # no steps
+    assert r.status_code == 422
+    assert sql("SELECT status, worker, error, completed_at FROM jobs WHERE id = %s",
+               job_id) == before
+    assert sql("SELECT count(*) FROM build_packs") == [(0,)]
+
+
 def test_steer_build_and_park(client):
     seed_briefs()
     discover(client, limit=1)
